@@ -1,0 +1,4740 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX0">
+		<Properties>
+			<string name="Name">Linkedsword</string>
+			<ProtectedString name="Source"><![CDATA[--[[
+	Linkedsword — Roblox Studio MCP Plugin
+	Agentic AI bridge with script diff review, activity feed, and a sleeping cat.
+
+	Architecture:
+	  1. HTTP long-poll loop connects to the Linkedsword MCP server
+	  2. Incoming tool requests are routed to handler modules
+	  3. Script diffs are staged in a pop-out window for visual review
+	  4. Mascot animation reflects connection state
+	  5. Settings page for theme/behavior customization
+]]
+
+-- Services
+local HttpService = game:GetService("HttpService")
+local Selection = game:GetService("Selection")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local RunService = game:GetService("RunService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local CollectionService = game:GetService("CollectionService")
+local StudioService = game:GetService("StudioService")
+local CoreGui = game:GetService("CoreGui")
+local InsertService = game:GetService("InsertService")
+local TweenService = game:GetService("TweenService")
+local LogService = game:GetService("LogService")
+local PathfindingService = game:GetService("PathfindingService")
+
+-- Constants
+local PLUGIN_VERSION = "0.4.0"
+local DEFAULT_PORT = 3003
+local HEARTBEAT_INTERVAL = 5
+local POLL_TIMEOUT = 30
+local MAX_RETRY_ATTEMPTS = 3
+
+-- Default theme (shadcn/zinc-inspired palette)
+local DEFAULT_THEME = {
+	accent = { 139, 92, 246 },        -- violet-500
+	success = { 22, 163, 74 },        -- green-600
+	error = { 220, 38, 38 },          -- red-600
+	background = { 9, 9, 11 },        -- zinc-950
+	cardBg = { 24, 24, 27 },          -- zinc-900
+	textPrimary = { 250, 250, 250 },  -- zinc-50
+	textSecondary = { 161, 161, 170 },-- zinc-400
+	border = { 39, 39, 42 },          -- zinc-800
+	inputBg = { 15, 15, 18 },         -- input background
+	muted = { 63, 63, 70 },           -- zinc-700
+	addLine = { 74, 222, 128 },       -- diff add
+	delLine = { 248, 113, 113 },      -- diff del
+	addBg = { 22, 45, 28 },           -- diff add bg
+	delBg = { 55, 20, 20 },           -- diff del bg
+	catBody = { 82, 82, 91 },         -- mascot body idle
+	catEye = { 161, 161, 170 },       -- mascot eye
+	catEarInner = { 113, 100, 120 },  -- mascot ear inner
+	sparkle = { 180, 140, 255 },      -- sparkle/accessory
+	swordGuard = { 200, 170, 50 },    -- sword crossguard/pommel
+	swordGrip = { 120, 80, 40 },      -- sword grip
+	warning = { 234, 179, 8 },        -- yellow-500 (latency/caution)
+}
+
+local function rgbFromTable(t)
+	return Color3.fromRGB(t[1], t[2], t[3])
+end
+
+-- State
+local serverUrl = "http://127.0.0.1:" .. DEFAULT_PORT
+local instanceId = HttpService:GenerateGUID(false)
+local connected = false
+local currentMode = "full" -- "full" | "inspector" | "sandbox"
+local diffQueue = {} -- { [diffId] = diffData }
+local activityLog = {} -- recent activity entries
+local pluginState = "disconnected" -- "disconnected" | "idle" | "active" | "error" | "playtesting"
+local running = false
+local activeUntil = 0 -- minimum time to stay in "active" state
+local ACTIVE_MIN_DURATION = 3 -- seconds
+
+-- UX polish state
+local lastHeartbeatData = nil -- last heartbeat response from server
+local lastLatencyMs = 0 -- heartbeat round-trip latency in ms
+local activeToasts = {} -- active toast notification frames
+local MAX_VISIBLE_TOASTS = 3
+
+-- Diff history (persisted across restarts)
+local diffHistory = plugin:GetSetting("LSDiffHistory") or {}
+local MAX_HISTORY_ENTRIES = 50
+
+local function saveDiffHistory()
+	while #diffHistory > MAX_HISTORY_ENTRIES do
+		table.remove(diffHistory, 1)
+	end
+	pcall(function() plugin:SetSetting("LSDiffHistory", diffHistory) end)
+end
+
+-- Playtest state
+local playtestLogs = {}
+local playtestStartTime = 0
+local logConnection = nil
+
+-- Console log capture (persistent, works in edit + play mode)
+local consoleLogs = {}
+local MAX_CONSOLE_LOGS = 500
+local consoleLogConnection = LogService.MessageOut:Connect(function(message, messageType)
+	table.insert(consoleLogs, {
+		type = if messageType == Enum.MessageType.MessageError then "error"
+			elseif messageType == Enum.MessageType.MessageWarning then "warning"
+			else "output",
+		message = message,
+		timestamp = os.clock(),
+	})
+	if #consoleLogs > MAX_CONSOLE_LOGS then table.remove(consoleLogs, 1) end
+end)
+
+-- Load saved settings
+local theme = plugin:GetSetting("LSTheme") or DEFAULT_THEME
+local settings = plugin:GetSetting("LSSettings") or {
+	autoAccept = false,
+	maxFeedEntries = 100,
+	showMascot = true,
+	mascotSkin = "cat",
+}
+if not settings.mascotSkin then settings.mascotSkin = "cat" end
+
+-- Ensure theme has all keys (in case new ones were added); deep-copy to avoid mutating DEFAULT_THEME
+for k, v in DEFAULT_THEME do
+	if not theme[k] then theme[k] = { unpack(v) } end
+end
+
+-- Plugin setup
+local toolbar = plugin:CreateToolbar("Linkedsword")
+local toggleButton = toolbar:CreateButton(
+	"Linkedsword",
+	"Toggle Linkedsword connection",
+	"rbxassetid://0", -- placeholder icon
+	"Linkedsword"
+)
+
+-- Script-related tools (for clickable feed entries)
+local SCRIPT_TOOLS = {
+	set_script_source = true,
+	set_script_source_direct = true,
+	patch_script = true,
+	grep_replace = true,
+	stage_diff = true,
+	get_script_source = true,
+}
+
+-- ============================================================================
+-- Utility Functions (declared before handlers so no forward-reference issues)
+-- ============================================================================
+
+local function resolveInstance(path: string?): Instance?
+	if not path then return nil end
+	local current: Instance = game
+	for _, segment in string.split(path, ".") do
+		if segment == "game" then continue end
+		local child = current:FindFirstChild(segment)
+		if not child then return nil end
+		current = child
+	end
+	return current
+end
+
+local function getInstancePath(inst: Instance): string
+	local parts = {}
+	local current = inst
+	while current and current ~= game do
+		table.insert(parts, 1, current.Name)
+		current = current.Parent
+	end
+	return "game." .. table.concat(parts, ".")
+end
+
+local function convertValue(val: any, propertyHint: string?): any
+	if type(val) == "table" then
+		if propertyHint and (
+			string.find(propertyHint, "Color") or
+			propertyHint == "BackgroundColor3" or
+			propertyHint == "TextColor3"
+		) then
+			if #val == 3 then
+				if val[1] > 1 or val[2] > 1 or val[3] > 1 then
+					return Color3.fromRGB(val[1], val[2], val[3])
+				else
+					return Color3.new(val[1], val[2], val[3])
+				end
+			end
+		end
+		if #val == 3 then
+			return Vector3.new(val[1], val[2], val[3])
+		elseif #val == 2 then
+			return Vector2.new(val[1], val[2])
+		elseif #val == 4 then
+			return UDim2.new(val[1], val[2], val[3], val[4])
+		elseif #val == 12 then
+			return CFrame.new(val[1], val[2], val[3], val[4], val[5], val[6], val[7], val[8], val[9], val[10], val[11], val[12])
+		end
+	end
+	if val == "true" then return true end
+	if val == "false" then return false end
+	-- BrickColor from string
+	if type(val) == "string" and propertyHint == "BrickColor" then
+		local ok, bc = pcall(BrickColor.new, val)
+		if ok then return bc end
+	end
+	-- Enum from string (e.g. Material = "Plastic")
+	if type(val) == "string" and propertyHint then
+		local ok, enumVal = pcall(function()
+			return (Enum :: any)[propertyHint] and (Enum :: any)[propertyHint][val]
+		end)
+		if ok and enumVal then return enumVal end
+	end
+	-- NumberRange from table {min, max}
+	if type(val) == "table" and #val == 2 and propertyHint and string.find(propertyHint, "Range") then
+		return NumberRange.new(val[1], val[2])
+	end
+	return val
+end
+
+local function executeLuau(code: string): { success: boolean, data: any? }
+	local output = {}
+	local wrapped = [[
+		local __output = ...
+		local function print(...)
+			local args = { ... }
+			local strs = {}
+			for _, v in args do table.insert(strs, tostring(v)) end
+			table.insert(__output, table.concat(strs, "\t"))
+		end
+		local function warn(...)
+			local args = { ... }
+			local strs = {}
+			for _, v in args do table.insert(strs, tostring(v)) end
+			table.insert(__output, "[WARN] " .. table.concat(strs, "\t"))
+		end
+	]] .. code
+
+	local fn, compileErr = loadstring(wrapped)
+	if not fn then
+		return { success = false, error = "Compile error: " .. tostring(compileErr) }
+	end
+	local ok, runtimeErr = pcall(fn, output)
+	if not ok then
+		return { success = false, error = "Runtime error: " .. tostring(runtimeErr), data = { output = table.concat(output, "\n") } }
+	end
+	return { success = true, data = { output = table.concat(output, "\n") } }
+end
+
+-- ============================================================================
+-- Mascot Registry — modular mascot skin system
+-- ============================================================================
+
+local MascotRegistry = {}
+
+-- Shared helpers for drawing mascot parts
+local function createMascotPart(props: any): Frame
+	local f = Instance.new("Frame")
+	f.Name = props.name or "Part"
+	f.Size = props.size
+	f.Position = props.position
+	f.BackgroundColor3 = props.color or Color3.fromRGB(82, 82, 91)
+	f.BackgroundTransparency = props.transparency or 0
+	f.BorderSizePixel = 0
+	f.Rotation = props.rotation or 0
+	if props.zindex then f.ZIndex = props.zindex end
+	f.Parent = props.parent
+	if props.cornerRadius then
+		Instance.new("UICorner", f).CornerRadius = props.cornerRadius
+	end
+	return f
+end
+
+local function createMascotLabel(props: any): TextLabel
+	local l = Instance.new("TextLabel")
+	l.Name = props.name or "Label"
+	l.Size = props.size
+	l.Position = props.position
+	l.BackgroundTransparency = 1
+	l.Text = props.text
+	l.TextColor3 = props.color or Color3.fromRGB(180, 140, 255)
+	l.TextSize = props.textSize or 12
+	l.Font = props.font or Enum.Font.GothamBold
+	l.TextTransparency = props.transparency or 1
+	l.Visible = if props.visible ~= nil then props.visible else true
+	l.Parent = props.parent
+	return l
+end
+
+-- Active mascot state (set when a skin is loaded)
+local currentMascotParts = nil :: any
+local currentMascotStop = nil :: (() -> ())?
+local currentMascotSkin = nil :: string?
+
+-- ============================================================================
+-- Cat Mascot (with Linked Sword)
+-- ============================================================================
+
+MascotRegistry.cat = {}
+
+function MascotRegistry.cat.draw(parent: Frame, th: any): any
+	local p = {}
+
+	p.glow = createMascotPart({
+		name = "Glow", parent = parent,
+		size = UDim2.new(0, 70, 0, 14),
+		position = UDim2.new(0.5, -35, 0.5, 20),
+		color = Color3.fromRGB(60, 60, 68),
+		transparency = 0.6,
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	p.body = createMascotPart({
+		name = "Body", parent = parent,
+		size = UDim2.new(0, 60, 0, 28),
+		position = UDim2.new(0.5, -30, 0.5, 2),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 14),
+	})
+
+	p.head = createMascotPart({
+		name = "Head", parent = parent,
+		size = UDim2.new(0, 34, 0, 34),
+		position = UDim2.new(0.5, -17, 0.5, -24),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	p.leftEar = createMascotPart({
+		name = "LeftEar", parent = p.head,
+		size = UDim2.new(0, 10, 0, 10),
+		position = UDim2.new(0, 2, 0, -6),
+		rotation = -20,
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 3),
+	})
+
+	p.rightEar = createMascotPart({
+		name = "RightEar", parent = p.head,
+		size = UDim2.new(0, 10, 0, 10),
+		position = UDim2.new(0, 22, 0, -6),
+		rotation = 20,
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 3),
+	})
+
+	p.leftEarInner = createMascotPart({
+		name = "LeftEarInner", parent = p.leftEar,
+		size = UDim2.new(0, 5, 0, 5),
+		position = UDim2.new(0.5, -2, 0.5, -2),
+		color = rgbFromTable(th.catEarInner),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	p.rightEarInner = createMascotPart({
+		name = "RightEarInner", parent = p.rightEar,
+		size = UDim2.new(0, 5, 0, 5),
+		position = UDim2.new(0.5, -3, 0.5, -2),
+		color = rgbFromTable(th.catEarInner),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	p.leftEye = createMascotPart({
+		name = "LeftEye", parent = p.head,
+		size = UDim2.new(0, 10, 0, 2),
+		position = UDim2.new(0, 6, 0, 16),
+		color = rgbFromTable(th.catEye),
+	})
+
+	p.rightEye = createMascotPart({
+		name = "RightEye", parent = p.head,
+		size = UDim2.new(0, 10, 0, 2),
+		position = UDim2.new(0, 18, 0, 16),
+		color = rgbFromTable(th.catEye),
+	})
+
+	p.tail = createMascotPart({
+		name = "Tail", parent = parent,
+		size = UDim2.new(0, 6, 0, 18),
+		position = UDim2.new(0.5, 30, 0.5, -4),
+		rotation = 20,
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 3),
+	})
+
+	-- Sword (Classic Linked Sword)
+	p.swordContainer = createMascotPart({
+		name = "Sword", parent = parent,
+		size = UDim2.new(0, 30, 0, 50),
+		position = UDim2.new(0.5, -48, 0.5, -10),
+		transparency = 1,
+	})
+
+	p.swordBladeGlow = createMascotPart({
+		name = "BladeGlow", parent = p.swordContainer,
+		size = UDim2.new(0, 10, 0, 28),
+		position = UDim2.new(0.5, -5, 0, 1),
+		color = rgbFromTable(th.accent),
+		transparency = 0.6,
+		cornerRadius = UDim.new(0, 3),
+	})
+
+	p.swordBlade = createMascotPart({
+		name = "Blade", parent = p.swordContainer,
+		size = UDim2.new(0, 6, 0, 30),
+		position = UDim2.new(0.5, -3, 0, 0),
+		color = rgbFromTable(th.accent),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	p.swordCrossguard = createMascotPart({
+		name = "Crossguard", parent = p.swordContainer,
+		size = UDim2.new(0, 14, 0, 4),
+		position = UDim2.new(0.5, -7, 0, 28),
+		color = rgbFromTable(th.swordGuard),
+		cornerRadius = UDim.new(0, 1),
+	})
+
+	p.swordGrip = createMascotPart({
+		name = "Grip", parent = p.swordContainer,
+		size = UDim2.new(0, 4, 0, 12),
+		position = UDim2.new(0.5, -2, 0, 31),
+		color = rgbFromTable(th.swordGrip),
+		cornerRadius = UDim.new(0, 1),
+	})
+
+	p.swordPommel = createMascotPart({
+		name = "Pommel", parent = p.swordContainer,
+		size = UDim2.new(0, 6, 0, 6),
+		position = UDim2.new(0.5, -3, 0, 42),
+		color = rgbFromTable(th.swordGuard),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	-- Z labels (sleep indicators)
+	p.zLabels = {}
+	p.zConfigs = {
+		{ text = "z", size = 12, offsetX = 22, offsetY = -26 },
+		{ text = "z", size = 16, offsetX = 30, offsetY = -34 },
+		{ text = "Z", size = 20, offsetX = 24, offsetY = -44 },
+	}
+	for i, cfg in ipairs(p.zConfigs) do
+		p.zLabels[i] = createMascotLabel({
+			name = "Zzz" .. i, parent = parent,
+			size = UDim2.new(0, 24, 0, 24),
+			position = UDim2.new(0.5, cfg.offsetX, 0.5, cfg.offsetY),
+			text = cfg.text,
+			color = rgbFromTable(th.textSecondary),
+			textSize = cfg.size,
+		})
+	end
+
+	-- Error bang
+	p.errorBang = createMascotLabel({
+		name = "ErrorBang", parent = parent,
+		size = UDim2.new(0, 16, 0, 16),
+		position = UDim2.new(0.5, 20, 0.5, -38),
+		text = "!",
+		color = rgbFromTable(th.error),
+		textSize = 18,
+		visible = false,
+	})
+
+	-- Sparkles
+	p.sparkles = {}
+	p.sparklePositions = {
+		UDim2.new(0.5, -38, 0.5, -20), UDim2.new(0.5, 38, 0.5, -14),
+		UDim2.new(0.5, -32, 0.5, 14), UDim2.new(0.5, 42, 0.5, 6),
+	}
+	for i, pos in ipairs(p.sparklePositions) do
+		p.sparkles[i] = createMascotLabel({
+			name = "Sparkle" .. i, parent = parent,
+			size = UDim2.new(0, 14, 0, 14),
+			position = pos,
+			text = if i % 2 == 0 then "\226\152\133" else "\226\156\166",
+			color = rgbFromTable(th.sparkle),
+			textSize = if i % 2 == 0 then 10 else 8,
+		})
+	end
+
+	-- State label
+	p.stateLabel = createMascotLabel({
+		name = "StateLabel", parent = parent,
+		size = UDim2.new(1, 0, 0, 16),
+		position = UDim2.new(0, 0, 1, -16),
+		text = "idle",
+		color = Color3.fromRGB(82, 82, 91),
+		textSize = 10,
+		font = Enum.Font.Code,
+		transparency = 0,
+	})
+
+	return p
+end
+
+function MascotRegistry.cat.animate(parts: any, getState: () -> string, isRunning: () -> boolean, widgetRef: any): () -> ()
+	local alive = true
+	local p = parts
+
+	-- Body breathing / hopping
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.body, TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Size = UDim2.new(0, 68, 0, 34), Position = UDim2.new(0.5, -34, 0.5, -1) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.body, TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Size = UDim2.new(0, 60, 0, 28), Position = UDim2.new(0.5, -30, 0.5, 2) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.body, TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -30, 0.5, -5) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.body, TweenInfo.new(0.22, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -30, 0.5, 2) })
+				t:Play(); t.Completed:Wait(); task.wait(0.25)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Head nodding / bobbing
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.head, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -17, 0.5, -28) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, -17, 0.5, -24) })
+				t:Play(); t.Completed:Wait(); task.wait(0.3)
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.head, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -17, 0.5, -22) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -17, 0.5, -24) })
+				t:Play(); t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	-- Tail swaying
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.tail, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -15 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tail, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 35 })
+				t:Play(); t.Completed:Wait()
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.tail, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 5 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tail, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 30 })
+				t:Play(); t.Completed:Wait()
+			elseif st == "error" then
+				local t = TweenService:Create(p.tail, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 55 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tail, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 65 })
+				t:Play(); t.Completed:Wait(); task.wait(1.5)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Sword animation (container position/rotation + blade glow in one loop to avoid conflicts)
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.swordContainer, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -5, Position = UDim2.new(0.5, -48, 0.5, -11) })
+				t:Play()
+				TweenService:Create(p.swordBladeGlow, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.6, Size = UDim2.new(0, 10, 0, 28) }):Play()
+				t.Completed:Wait()
+				t = TweenService:Create(p.swordContainer, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 5, Position = UDim2.new(0.5, -48, 0.5, -9) })
+				t:Play()
+				TweenService:Create(p.swordBladeGlow, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.75, Size = UDim2.new(0, 10, 0, 28) }):Play()
+				t.Completed:Wait()
+			elseif st == "active" or st == "playtesting" then
+				p.swordContainer.Position = UDim2.new(0.5, -50, 0.5, -12)
+				local t = TweenService:Create(p.swordContainer, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Rotation = 60, Position = UDim2.new(0.5, -44, 0.5, -14) })
+				t:Play()
+				TweenService:Create(p.swordBladeGlow, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.3, Size = UDim2.new(0, 14, 0, 32) }):Play()
+				t.Completed:Wait()
+				t = TweenService:Create(p.swordContainer, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Rotation = -30, Position = UDim2.new(0.5, -50, 0.5, -10) })
+				t:Play()
+				TweenService:Create(p.swordBladeGlow, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.6, Size = UDim2.new(0, 10, 0, 28) }):Play()
+				t.Completed:Wait()
+				task.wait(0.3)
+			elseif st == "error" then
+				local t = TweenService:Create(p.swordContainer, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 70, Position = UDim2.new(0.5, -44, 0.5, 8) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.swordContainer, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 80, Position = UDim2.new(0.5, -44, 0.5, 8) })
+				t:Play(); t.Completed:Wait()
+				p.swordBladeGlow.BackgroundTransparency = 0.85
+			else task.wait(1) end
+		end
+	end)
+
+	-- Z labels floating
+	for zIndex, zl in ipairs(p.zLabels) do
+		task.spawn(function()
+			local staggerDelay = (zIndex - 1) * 0.8
+			local cfg = p.zConfigs[zIndex]
+			local startY = cfg.offsetY
+			local floatDistance = 20 + (zIndex * 4)
+			while alive and (isRunning() or getState() ~= "") do
+				if not widgetRef.Parent then break end
+				if getState() == "idle" or getState() == "disconnected" then
+					task.wait(staggerDelay)
+					if not alive then break end
+					zl.Position = UDim2.new(0.5, cfg.offsetX, 0.5, startY); zl.TextTransparency = 0.2
+					local t = TweenService:Create(zl, TweenInfo.new(2.0 + zIndex * 0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, cfg.offsetX + (zIndex * 2), 0.5, startY - floatDistance), TextTransparency = 1 })
+					t:Play(); t.Completed:Wait()
+					if not alive then break end
+					zl.Position = UDim2.new(0.5, cfg.offsetX, 0.5, startY); task.wait(0.2)
+				else zl.TextTransparency = 1; task.wait(0.5) end
+			end
+		end)
+	end
+
+	-- Sparkles
+	for spIndex, sp in ipairs(p.sparkles) do
+		task.spawn(function()
+			local basePos = p.sparklePositions[spIndex]
+			local stagger = (spIndex - 1) * 0.4
+			while alive and (isRunning() or getState() ~= "") do
+				if not widgetRef.Parent then break end
+				if getState() == "active" or getState() == "playtesting" then
+					task.wait(stagger)
+					if not alive then break end
+					sp.Position = basePos; sp.TextTransparency = 0.3
+					sp.TextSize = if spIndex % 2 == 0 then 10 else 8
+					local t = TweenService:Create(sp, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { TextTransparency = 0, TextSize = if spIndex % 2 == 0 then 14 else 11 })
+					t:Play(); t.Completed:Wait()
+					if not alive then break end
+					t = TweenService:Create(sp, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { TextTransparency = 1, Position = UDim2.new(basePos.X.Scale, basePos.X.Offset, basePos.Y.Scale, basePos.Y.Offset - 10) })
+					t:Play(); t.Completed:Wait(); if not alive then break end; sp.Position = basePos; task.wait(0.5 + spIndex * 0.2)
+				else sp.TextTransparency = 1; task.wait(0.5) end
+			end
+		end)
+	end
+
+	-- Error bang
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			if getState() == "error" then
+				p.errorBang.Visible = true
+				local t = TweenService:Create(p.errorBang, TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { TextTransparency = 0, TextSize = 22 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.errorBang, TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { TextTransparency = 0.3, TextSize = 16 })
+				t:Play(); t.Completed:Wait(); task.wait(0.3)
+			else p.errorBang.Visible = false; p.errorBang.TextTransparency = 1; task.wait(0.5) end
+		end
+	end)
+
+	-- Glow pulse
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.glow, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.35, Size = UDim2.new(0, 76, 0, 16) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.glow, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.6, Size = UDim2.new(0, 70, 0, 14) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.5 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.7 })
+				t:Play(); t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	return function() alive = false end
+end
+
+function MascotRegistry.cat.updateState(parts: any, state: string, th: any)
+	local p = parts
+	local catColor = state == "active" and rgbFromTable(th.accent)
+		or state == "playtesting" and rgbFromTable(th.success)
+		or state == "error" and rgbFromTable(th.error)
+		or rgbFromTable(th.catBody)
+	p.body.BackgroundColor3 = catColor
+	p.head.BackgroundColor3 = catColor
+	p.leftEar.BackgroundColor3 = catColor
+	p.rightEar.BackgroundColor3 = catColor
+	p.tail.BackgroundColor3 = catColor
+
+	if state == "active" then
+		p.glow.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
+		p.glow.BackgroundTransparency = 0.5
+	elseif state == "error" then
+		p.glow.BackgroundColor3 = Color3.fromRGB(140, 40, 40)
+		p.glow.BackgroundTransparency = 0.5
+	else
+		p.glow.BackgroundColor3 = Color3.fromRGB(60, 60, 68)
+		p.glow.BackgroundTransparency = 0.6
+	end
+
+	p.errorBang.Visible = (state == "error")
+	p.errorBang.TextTransparency = if state == "error" then 0 else 1
+
+	if state == "error" then
+		p.tail.Rotation = 60
+		p.tail.Position = UDim2.new(0.5, 30, 0.5, 4)
+	else
+		p.tail.Rotation = 20
+		p.tail.Position = UDim2.new(0.5, 30, 0.5, -4)
+	end
+
+	if state == "active" or state == "playtesting" then
+		p.leftEye.Size = UDim2.new(0, 6, 0, 6)
+		p.rightEye.Size = UDim2.new(0, 6, 0, 6)
+		p.leftEye.Position = UDim2.new(0, 8, 0, 13)
+		p.rightEye.Position = UDim2.new(0, 20, 0, 13)
+		local ecL = p.leftEye:FindFirstChild("Corner") or Instance.new("UICorner")
+		ecL.Name = "Corner"; ecL.CornerRadius = UDim.new(1, 0); ecL.Parent = p.leftEye
+		local ecR = p.rightEye:FindFirstChild("Corner") or Instance.new("UICorner")
+		ecR.Name = "Corner"; ecR.CornerRadius = UDim.new(1, 0); ecR.Parent = p.rightEye
+		for _, zl in ipairs(p.zLabels) do zl.Visible = false end
+	else
+		p.leftEye.Size = UDim2.new(0, 10, 0, 2)
+		p.rightEye.Size = UDim2.new(0, 10, 0, 2)
+		p.leftEye.Position = UDim2.new(0, 6, 0, 16)
+		p.rightEye.Position = UDim2.new(0, 18, 0, 16)
+		local showZ = (state == "idle" or state == "disconnected")
+		for _, zl in ipairs(p.zLabels) do zl.Visible = showZ end
+	end
+
+	for _, sp in ipairs(p.sparkles) do
+		sp.Visible = (state == "active" or state == "playtesting")
+		if not sp.Visible then sp.TextTransparency = 1 end
+	end
+
+	-- Sword state
+	p.swordBlade.BackgroundColor3 = rgbFromTable(th.accent)
+	p.swordBladeGlow.BackgroundColor3 = rgbFromTable(th.accent)
+	p.swordCrossguard.BackgroundColor3 = rgbFromTable(th.swordGuard)
+	p.swordPommel.BackgroundColor3 = rgbFromTable(th.swordGuard)
+	p.swordGrip.BackgroundColor3 = rgbFromTable(th.swordGrip)
+
+	if state == "error" then
+		p.swordContainer.Rotation = 75
+		p.swordContainer.Position = UDim2.new(0.5, -44, 0.5, 8)
+		p.swordBladeGlow.BackgroundTransparency = 0.85
+	elseif state == "active" or state == "playtesting" then
+		p.swordContainer.Position = UDim2.new(0.5, -50, 0.5, -12)
+	else
+		p.swordContainer.Rotation = 0
+		p.swordContainer.Position = UDim2.new(0.5, -48, 0.5, -10)
+		p.swordBladeGlow.BackgroundTransparency = 0.6
+	end
+
+	p.stateLabel.Text = state
+end
+
+-- ============================================================================
+-- Robot Mascot
+-- ============================================================================
+
+MascotRegistry.robot = {}
+
+function MascotRegistry.robot.draw(parent: Frame, th: any): any
+	local p = {}
+
+	p.glow = createMascotPart({
+		name = "Glow", parent = parent,
+		size = UDim2.new(0, 66, 0, 12),
+		position = UDim2.new(0.5, -33, 0.5, 24),
+		color = Color3.fromRGB(60, 60, 68),
+		transparency = 0.6,
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	-- Antenna
+	p.antennaPole = createMascotPart({
+		name = "AntennaPole", parent = parent,
+		size = UDim2.new(0, 4, 0, 12),
+		position = UDim2.new(0.5, -2, 0.5, -42),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 1),
+	})
+
+	p.antennaLight = createMascotPart({
+		name = "AntennaLight", parent = parent,
+		size = UDim2.new(0, 6, 0, 6),
+		position = UDim2.new(0.5, -3, 0.5, -47),
+		color = rgbFromTable(th.accent),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	-- Head (square with rounded corners)
+	p.head = createMascotPart({
+		name = "Head", parent = parent,
+		size = UDim2.new(0, 30, 0, 30),
+		position = UDim2.new(0.5, -15, 0.5, -30),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 4),
+	})
+
+	-- Eyes (LED circles)
+	p.leftEye = createMascotPart({
+		name = "LeftEye", parent = p.head,
+		size = UDim2.new(0, 8, 0, 8),
+		position = UDim2.new(0, 4, 0, 8),
+		color = rgbFromTable(th.catEye),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	p.rightEye = createMascotPart({
+		name = "RightEye", parent = p.head,
+		size = UDim2.new(0, 8, 0, 8),
+		position = UDim2.new(0, 18, 0, 8),
+		color = rgbFromTable(th.catEye),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	-- Mouth (small bar)
+	p.mouth = createMascotPart({
+		name = "Mouth", parent = p.head,
+		size = UDim2.new(0, 12, 0, 2),
+		position = UDim2.new(0.5, -6, 0, 22),
+		color = rgbFromTable(th.catEye),
+	})
+
+	-- Body
+	p.body = createMascotPart({
+		name = "Body", parent = parent,
+		size = UDim2.new(0, 50, 0, 30),
+		position = UDim2.new(0.5, -25, 0.5, 0),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 4),
+	})
+
+	-- Screen/display on body
+	p.screen = createMascotPart({
+		name = "Screen", parent = p.body,
+		size = UDim2.new(0, 40, 0, 14),
+		position = UDim2.new(0.5, -20, 0.5, -7),
+		color = rgbFromTable(th.accent),
+		transparency = 0.3,
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	-- Arms
+	p.leftArm = createMascotPart({
+		name = "LeftArm", parent = parent,
+		size = UDim2.new(0, 6, 0, 20),
+		position = UDim2.new(0.5, -32, 0.5, 2),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	p.rightArm = createMascotPart({
+		name = "RightArm", parent = parent,
+		size = UDim2.new(0, 6, 0, 20),
+		position = UDim2.new(0.5, 26, 0.5, 2),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	-- Legs
+	p.leftLeg = createMascotPart({
+		name = "LeftLeg", parent = parent,
+		size = UDim2.new(0, 8, 0, 10),
+		position = UDim2.new(0.5, -14, 0.5, 30),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	p.rightLeg = createMascotPart({
+		name = "RightLeg", parent = parent,
+		size = UDim2.new(0, 8, 0, 10),
+		position = UDim2.new(0.5, 6, 0.5, 30),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	-- Signal waves (accessories for active state)
+	p.signals = {}
+	for i = 1, 3 do
+		p.signals[i] = createMascotLabel({
+			name = "Signal" .. i, parent = parent,
+			size = UDim2.new(0, 12, 0, 12),
+			position = UDim2.new(0.5, 18 + i * 6, 0.5, -44 + i * 2),
+			text = ")",
+			color = rgbFromTable(th.sparkle),
+			textSize = 8 + i * 2,
+		})
+	end
+
+	-- Gear icons (like sparkles for robot)
+	p.gears = {}
+	local gearPositions = {
+		UDim2.new(0.5, -40, 0.5, -16), UDim2.new(0.5, 38, 0.5, -8),
+		UDim2.new(0.5, -36, 0.5, 18), UDim2.new(0.5, 40, 0.5, 12),
+	}
+	for i, pos in ipairs(gearPositions) do
+		p.gears[i] = createMascotLabel({
+			name = "Gear" .. i, parent = parent,
+			size = UDim2.new(0, 14, 0, 14),
+			position = pos,
+			text = if i % 2 == 0 then "\226\154\153" else "\226\154\161",
+			color = rgbFromTable(th.sparkle),
+			textSize = if i % 2 == 0 then 10 else 8,
+		})
+	end
+	p.gearPositions = gearPositions
+
+	-- Error sparks
+	p.errorSpark = createMascotLabel({
+		name = "ErrorSpark", parent = parent,
+		size = UDim2.new(0, 16, 0, 16),
+		position = UDim2.new(0.5, 18, 0.5, -36),
+		text = "\226\154\161",
+		color = rgbFromTable(th.error),
+		textSize = 16,
+		visible = false,
+	})
+
+	p.stateLabel = createMascotLabel({
+		name = "StateLabel", parent = parent,
+		size = UDim2.new(1, 0, 0, 16),
+		position = UDim2.new(0, 0, 1, -16),
+		text = "idle",
+		color = Color3.fromRGB(82, 82, 91),
+		textSize = 10,
+		font = Enum.Font.Code,
+		transparency = 0,
+	})
+
+	return p
+end
+
+function MascotRegistry.robot.animate(parts: any, getState: () -> string, isRunning: () -> boolean, widgetRef: any): () -> ()
+	local alive = true
+	local p = parts
+
+	-- Body hover / bounce
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.body, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -25, 0.5, -2) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.body, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -25, 0.5, 2) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.body, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -25, 0.5, -6) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.body, TweenInfo.new(0.2, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -25, 0.5, 0) })
+				t:Play(); t.Completed:Wait(); task.wait(0.2)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Head hover
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.head, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -15, 0.5, -32) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -15, 0.5, -30) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.head, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -15, 0.5, -34) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, -15, 0.5, -30) })
+				t:Play(); t.Completed:Wait(); task.wait(0.25)
+			elseif st == "error" then
+				local t = TweenService:Create(p.head, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 15 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 0 })
+				t:Play(); t.Completed:Wait(); task.wait(1.5)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Antenna LED blink
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.antennaLight, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.7 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.antennaLight, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0 })
+				t:Play(); t.Completed:Wait()
+			elseif st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.antennaLight, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.5 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.antennaLight, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0 })
+				t:Play(); t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	-- Arm swing
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.leftArm, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -15 })
+				t:Play()
+				local t2 = TweenService:Create(p.rightArm, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 15 })
+				t2:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.leftArm, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 15 })
+				t:Play()
+				t2 = TweenService:Create(p.rightArm, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -15 })
+				t2:Play(); t.Completed:Wait()
+			else
+				p.leftArm.Rotation = 0; p.rightArm.Rotation = 0; task.wait(0.5)
+			end
+		end
+	end)
+
+	-- Screen flicker
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.screen, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.1 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.screen, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.4 })
+				t:Play(); t.Completed:Wait()
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.screen, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.5 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.screen, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.3 })
+				t:Play(); t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	-- Gear sparkles (like cat sparkles)
+	for gIdx, gear in ipairs(p.gears) do
+		task.spawn(function()
+			local basePos = p.gearPositions[gIdx]
+			local stagger = (gIdx - 1) * 0.4
+			while alive and (isRunning() or getState() ~= "") do
+				if not widgetRef.Parent then break end
+				if getState() == "active" or getState() == "playtesting" then
+					task.wait(stagger)
+					if not alive then break end
+					gear.Position = basePos; gear.TextTransparency = 0.3
+					local t = TweenService:Create(gear, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { TextTransparency = 0, TextSize = if gIdx % 2 == 0 then 14 else 11 })
+					t:Play(); t.Completed:Wait()
+					if not alive then break end
+					t = TweenService:Create(gear, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { TextTransparency = 1, Position = UDim2.new(basePos.X.Scale, basePos.X.Offset, basePos.Y.Scale, basePos.Y.Offset - 10) })
+					t:Play(); t.Completed:Wait(); if not alive then break end; gear.Position = basePos; task.wait(0.5 + gIdx * 0.2)
+				else gear.TextTransparency = 1; task.wait(0.5) end
+			end
+		end)
+	end
+
+	-- Signal waves
+	for sIdx, sig in ipairs(p.signals) do
+		task.spawn(function()
+			while alive and (isRunning() or getState() ~= "") do
+				if not widgetRef.Parent then break end
+				if getState() == "active" or getState() == "playtesting" then
+					task.wait((sIdx - 1) * 0.3)
+					if not alive then break end
+					sig.TextTransparency = 0.2
+					local t = TweenService:Create(sig, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { TextTransparency = 1 })
+					t:Play(); t.Completed:Wait(); task.wait(0.3)
+				else sig.TextTransparency = 1; task.wait(0.5) end
+			end
+		end)
+	end
+
+	-- Error spark
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			if getState() == "error" then
+				p.errorSpark.Visible = true
+				local t = TweenService:Create(p.errorSpark, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { TextTransparency = 0, TextSize = 20 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.errorSpark, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { TextTransparency = 0.5, TextSize = 14 })
+				t:Play(); t.Completed:Wait(); task.wait(0.4)
+			else p.errorSpark.Visible = false; p.errorSpark.TextTransparency = 1; task.wait(0.5) end
+		end
+	end)
+
+	-- Glow
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.glow, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.35, Size = UDim2.new(0, 72, 0, 14) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.glow, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.6, Size = UDim2.new(0, 66, 0, 12) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.5 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.7 })
+				t:Play(); t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	return function() alive = false end
+end
+
+function MascotRegistry.robot.updateState(parts: any, state: string, th: any)
+	local p = parts
+	local bodyColor = state == "active" and rgbFromTable(th.accent)
+		or state == "playtesting" and rgbFromTable(th.success)
+		or state == "error" and rgbFromTable(th.error)
+		or rgbFromTable(th.catBody)
+	p.body.BackgroundColor3 = bodyColor
+	p.head.BackgroundColor3 = bodyColor
+	p.leftArm.BackgroundColor3 = bodyColor
+	p.rightArm.BackgroundColor3 = bodyColor
+	p.leftLeg.BackgroundColor3 = bodyColor
+	p.rightLeg.BackgroundColor3 = bodyColor
+	p.antennaPole.BackgroundColor3 = bodyColor
+	p.antennaLight.BackgroundColor3 = rgbFromTable(th.accent)
+	p.screen.BackgroundColor3 = rgbFromTable(th.accent)
+	p.mouth.BackgroundColor3 = rgbFromTable(th.catEye)
+	p.leftEye.BackgroundColor3 = rgbFromTable(th.catEye)
+	p.rightEye.BackgroundColor3 = rgbFromTable(th.catEye)
+
+	if state == "active" then
+		p.glow.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
+		p.glow.BackgroundTransparency = 0.5
+	elseif state == "error" then
+		p.glow.BackgroundColor3 = Color3.fromRGB(140, 40, 40)
+		p.glow.BackgroundTransparency = 0.5
+		p.screen.BackgroundColor3 = rgbFromTable(th.error)
+	else
+		p.glow.BackgroundColor3 = Color3.fromRGB(60, 60, 68)
+		p.glow.BackgroundTransparency = 0.6
+	end
+
+	p.errorSpark.Visible = (state == "error")
+
+	for _, gear in ipairs(p.gears) do
+		gear.Visible = (state == "active" or state == "playtesting")
+		if not gear.Visible then gear.TextTransparency = 1 end
+	end
+
+	for _, sig in ipairs(p.signals) do
+		sig.Visible = (state == "active" or state == "playtesting")
+		if not sig.Visible then sig.TextTransparency = 1 end
+	end
+
+	p.stateLabel.Text = state
+end
+
+-- ============================================================================
+-- Dog Mascot
+-- ============================================================================
+
+MascotRegistry.dog = {}
+
+function MascotRegistry.dog.draw(parent: Frame, th: any): any
+	local p = {}
+
+	p.glow = createMascotPart({
+		name = "Glow", parent = parent,
+		size = UDim2.new(0, 72, 0, 14),
+		position = UDim2.new(0.5, -36, 0.5, 22),
+		color = Color3.fromRGB(60, 60, 68),
+		transparency = 0.6,
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	p.body = createMascotPart({
+		name = "Body", parent = parent,
+		size = UDim2.new(0, 56, 0, 30),
+		position = UDim2.new(0.5, -28, 0.5, 2),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 12),
+	})
+
+	p.head = createMascotPart({
+		name = "Head", parent = parent,
+		size = UDim2.new(0, 36, 0, 32),
+		position = UDim2.new(0.5, -18, 0.5, -24),
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 10),
+	})
+
+	-- Floppy ears (hanging down, rotated outward)
+	p.leftEar = createMascotPart({
+		name = "LeftEar", parent = p.head,
+		size = UDim2.new(0, 8, 0, 16),
+		position = UDim2.new(0, -2, 0, 2),
+		rotation = -10,
+		color = rgbFromTable(th.catEarInner),
+		cornerRadius = UDim.new(0, 4),
+	})
+
+	p.rightEar = createMascotPart({
+		name = "RightEar", parent = p.head,
+		size = UDim2.new(0, 8, 0, 16),
+		position = UDim2.new(0, 30, 0, 2),
+		rotation = 10,
+		color = rgbFromTable(th.catEarInner),
+		cornerRadius = UDim.new(0, 4),
+	})
+
+	-- Big round eyes
+	p.leftEye = createMascotPart({
+		name = "LeftEye", parent = p.head,
+		size = UDim2.new(0, 8, 0, 8),
+		position = UDim2.new(0, 6, 0, 8),
+		color = rgbFromTable(th.catEye),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	p.rightEye = createMascotPart({
+		name = "RightEye", parent = p.head,
+		size = UDim2.new(0, 8, 0, 8),
+		position = UDim2.new(0, 22, 0, 8),
+		color = rgbFromTable(th.catEye),
+		cornerRadius = UDim.new(1, 0),
+	})
+
+	-- Nose
+	p.nose = createMascotPart({
+		name = "Nose", parent = p.head,
+		size = UDim2.new(0, 6, 0, 4),
+		position = UDim2.new(0.5, -3, 0, 18),
+		color = Color3.fromRGB(40, 40, 45),
+		cornerRadius = UDim.new(0, 2),
+	})
+
+	-- Tongue (visible when active)
+	p.tongue = createMascotPart({
+		name = "Tongue", parent = p.head,
+		size = UDim2.new(0, 5, 0, 8),
+		position = UDim2.new(0.5, -2, 0, 22),
+		color = Color3.fromRGB(240, 120, 140),
+		cornerRadius = UDim.new(0, 2),
+		transparency = 1,
+	})
+
+	-- Tail (curving upward)
+	p.tail = createMascotPart({
+		name = "Tail", parent = parent,
+		size = UDim2.new(0, 6, 0, 20),
+		position = UDim2.new(0.5, 30, 0.5, -8),
+		rotation = -30,
+		color = rgbFromTable(th.catBody),
+		cornerRadius = UDim.new(0, 3),
+	})
+
+	-- Paws
+	p.paws = {}
+	local pawPositions = {
+		UDim2.new(0.5, -22, 0.5, 28),
+		UDim2.new(0.5, -10, 0.5, 28),
+		UDim2.new(0.5, 4, 0.5, 28),
+		UDim2.new(0.5, 16, 0.5, 28),
+	}
+	for i, pos in ipairs(pawPositions) do
+		p.paws[i] = createMascotPart({
+			name = "Paw" .. i, parent = parent,
+			size = UDim2.new(0, 8, 0, 6),
+			position = pos,
+			color = rgbFromTable(th.catBody),
+			cornerRadius = UDim.new(0, 2),
+		})
+	end
+
+	-- Hearts (instead of sparkles)
+	p.hearts = {}
+	p.heartPositions = {
+		UDim2.new(0.5, -38, 0.5, -18), UDim2.new(0.5, 36, 0.5, -12),
+		UDim2.new(0.5, -34, 0.5, 14), UDim2.new(0.5, 40, 0.5, 8),
+	}
+	for i, pos in ipairs(p.heartPositions) do
+		p.hearts[i] = createMascotLabel({
+			name = "Heart" .. i, parent = parent,
+			size = UDim2.new(0, 14, 0, 14),
+			position = pos,
+			text = "\226\153\165",
+			color = Color3.fromRGB(255, 100, 130),
+			textSize = if i % 2 == 0 then 10 else 8,
+		})
+	end
+
+	-- Bone Z's (instead of Z labels)
+	p.bones = {}
+	p.boneConfigs = {
+		{ text = "\240\159\166\180", size = 10, offsetX = 24, offsetY = -28 },
+		{ text = "\240\159\166\180", size = 13, offsetX = 32, offsetY = -36 },
+		{ text = "\240\159\166\180", size = 16, offsetX = 26, offsetY = -46 },
+	}
+	for i, cfg in ipairs(p.boneConfigs) do
+		p.bones[i] = createMascotLabel({
+			name = "Bone" .. i, parent = parent,
+			size = UDim2.new(0, 24, 0, 24),
+			position = UDim2.new(0.5, cfg.offsetX, 0.5, cfg.offsetY),
+			text = cfg.text,
+			color = rgbFromTable(th.textSecondary),
+			textSize = cfg.size,
+		})
+	end
+
+	-- Error whimper
+	p.errorWhimper = createMascotLabel({
+		name = "ErrorWhimper", parent = parent,
+		size = UDim2.new(0, 20, 0, 16),
+		position = UDim2.new(0.5, 20, 0.5, -36),
+		text = "...",
+		color = rgbFromTable(th.error),
+		textSize = 14,
+		visible = false,
+	})
+
+	p.stateLabel = createMascotLabel({
+		name = "StateLabel", parent = parent,
+		size = UDim2.new(1, 0, 0, 16),
+		position = UDim2.new(0, 0, 1, -16),
+		text = "idle",
+		color = Color3.fromRGB(82, 82, 91),
+		textSize = 10,
+		font = Enum.Font.Code,
+		transparency = 0,
+	})
+
+	return p
+end
+
+function MascotRegistry.dog.animate(parts: any, getState: () -> string, isRunning: () -> boolean, widgetRef: any): () -> ()
+	local alive = true
+	local p = parts
+
+	-- Body breathing / bouncing
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.body, TweenInfo.new(2.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Size = UDim2.new(0, 62, 0, 34), Position = UDim2.new(0.5, -31, 0.5, 0) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.body, TweenInfo.new(2.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Size = UDim2.new(0, 56, 0, 30), Position = UDim2.new(0.5, -28, 0.5, 2) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.body, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -28, 0.5, -4) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.body, TweenInfo.new(0.15, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -28, 0.5, 2) })
+				t:Play(); t.Completed:Wait(); task.wait(0.15)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Head bobbing
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.head, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, -18, 0.5, -28) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, -18, 0.5, -24) })
+				t:Play(); t.Completed:Wait(); task.wait(0.2)
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.head, TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -18, 0.5, -22) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, -18, 0.5, -24) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "error" then
+				local t = TweenService:Create(p.head, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -10 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.head, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 0 })
+				t:Play(); t.Completed:Wait(); task.wait(1.0)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Tail wagging
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.tail, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -50 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tail, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 10 })
+				t:Play(); t.Completed:Wait()
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.tail, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -40 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tail, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -20 })
+				t:Play(); t.Completed:Wait()
+			elseif st == "error" then
+				local t = TweenService:Create(p.tail, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 40, Position = UDim2.new(0.5, 28, 0.5, 10) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tail, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 50, Position = UDim2.new(0.5, 28, 0.5, 10) })
+				t:Play(); t.Completed:Wait(); task.wait(1.5)
+			else task.wait(1) end
+		end
+	end)
+
+	-- Ear sway
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.leftEar, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -20 })
+				t:Play()
+				TweenService:Create(p.rightEar, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 20 }):Play()
+				t.Completed:Wait()
+				t = TweenService:Create(p.leftEar, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -5 })
+				t:Play()
+				TweenService:Create(p.rightEar, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 5 }):Play()
+				t.Completed:Wait(); task.wait(0.2)
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.leftEar, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -15 })
+				t:Play()
+				TweenService:Create(p.rightEar, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 15 }):Play()
+				t.Completed:Wait()
+				t = TweenService:Create(p.leftEar, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = -5 })
+				t:Play()
+				TweenService:Create(p.rightEar, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Rotation = 5 }):Play()
+				t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	-- Tongue panting (visible in active)
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				p.tongue.BackgroundTransparency = 0
+				local t = TweenService:Create(p.tongue, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Size = UDim2.new(0, 5, 0, 10) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.tongue, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Size = UDim2.new(0, 5, 0, 6) })
+				t:Play(); t.Completed:Wait()
+			else p.tongue.BackgroundTransparency = 1; task.wait(0.5) end
+		end
+	end)
+
+	-- Bone floating (like Z labels)
+	for bIdx, bone in ipairs(p.bones) do
+		task.spawn(function()
+			local stagger = (bIdx - 1) * 0.8
+			local cfg = p.boneConfigs[bIdx]
+			local startY = cfg.offsetY
+			local floatDist = 18 + (bIdx * 4)
+			while alive and (isRunning() or getState() ~= "") do
+				if not widgetRef.Parent then break end
+				if getState() == "idle" or getState() == "disconnected" then
+					task.wait(stagger)
+					if not alive then break end
+					bone.Position = UDim2.new(0.5, cfg.offsetX, 0.5, startY); bone.TextTransparency = 0.2
+					local t = TweenService:Create(bone, TweenInfo.new(2.0 + bIdx * 0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Position = UDim2.new(0.5, cfg.offsetX + (bIdx * 2), 0.5, startY - floatDist), TextTransparency = 1 })
+					t:Play(); t.Completed:Wait()
+					if not alive then break end
+					bone.Position = UDim2.new(0.5, cfg.offsetX, 0.5, startY); task.wait(0.2)
+				else bone.TextTransparency = 1; task.wait(0.5) end
+			end
+		end)
+	end
+
+	-- Hearts (like sparkles)
+	for hIdx, heart in ipairs(p.hearts) do
+		task.spawn(function()
+			local basePos = p.heartPositions[hIdx]
+			local stagger = (hIdx - 1) * 0.4
+			while alive and (isRunning() or getState() ~= "") do
+				if not widgetRef.Parent then break end
+				if getState() == "active" or getState() == "playtesting" then
+					task.wait(stagger)
+					if not alive then break end
+					heart.Position = basePos; heart.TextTransparency = 0.3
+					local t = TweenService:Create(heart, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { TextTransparency = 0, TextSize = if hIdx % 2 == 0 then 14 else 11 })
+					t:Play(); t.Completed:Wait()
+					if not alive then break end
+					t = TweenService:Create(heart, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { TextTransparency = 1, Position = UDim2.new(basePos.X.Scale, basePos.X.Offset, basePos.Y.Scale, basePos.Y.Offset - 12) })
+					t:Play(); t.Completed:Wait(); if not alive then break end; heart.Position = basePos; task.wait(0.5 + hIdx * 0.2)
+				else heart.TextTransparency = 1; task.wait(0.5) end
+			end
+		end)
+	end
+
+	-- Error whimper
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			if getState() == "error" then
+				p.errorWhimper.Visible = true
+				local t = TweenService:Create(p.errorWhimper, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { TextTransparency = 0 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.errorWhimper, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { TextTransparency = 0.5 })
+				t:Play(); t.Completed:Wait(); task.wait(0.5)
+			else p.errorWhimper.Visible = false; p.errorWhimper.TextTransparency = 1; task.wait(0.5) end
+		end
+	end)
+
+	-- Glow
+	task.spawn(function()
+		while alive and (isRunning() or getState() ~= "") do
+			if not widgetRef.Parent then break end
+			local st = getState()
+			if st == "active" or st == "playtesting" then
+				local t = TweenService:Create(p.glow, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.35, Size = UDim2.new(0, 78, 0, 16) })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.glow, TweenInfo.new(1.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.6, Size = UDim2.new(0, 72, 0, 14) })
+				t:Play(); t.Completed:Wait()
+			elseif st == "idle" or st == "disconnected" then
+				local t = TweenService:Create(p.glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.5 })
+				t:Play(); t.Completed:Wait()
+				t = TweenService:Create(p.glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.7 })
+				t:Play(); t.Completed:Wait()
+			else task.wait(1) end
+		end
+	end)
+
+	return function() alive = false end
+end
+
+function MascotRegistry.dog.updateState(parts: any, state: string, th: any)
+	local p = parts
+	local bodyColor = state == "active" and rgbFromTable(th.accent)
+		or state == "playtesting" and rgbFromTable(th.success)
+		or state == "error" and rgbFromTable(th.error)
+		or rgbFromTable(th.catBody)
+	p.body.BackgroundColor3 = bodyColor
+	p.head.BackgroundColor3 = bodyColor
+	p.tail.BackgroundColor3 = bodyColor
+	for _, paw in ipairs(p.paws) do paw.BackgroundColor3 = bodyColor end
+	p.leftEar.BackgroundColor3 = rgbFromTable(th.catEarInner)
+	p.rightEar.BackgroundColor3 = rgbFromTable(th.catEarInner)
+	p.leftEye.BackgroundColor3 = rgbFromTable(th.catEye)
+	p.rightEye.BackgroundColor3 = rgbFromTable(th.catEye)
+
+	if state == "active" then
+		p.glow.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
+		p.glow.BackgroundTransparency = 0.5
+	elseif state == "error" then
+		p.glow.BackgroundColor3 = Color3.fromRGB(140, 40, 40)
+		p.glow.BackgroundTransparency = 0.5
+	else
+		p.glow.BackgroundColor3 = Color3.fromRGB(60, 60, 68)
+		p.glow.BackgroundTransparency = 0.6
+	end
+
+	p.errorWhimper.Visible = (state == "error")
+
+	if state == "error" then
+		p.tail.Rotation = 40
+		p.tail.Position = UDim2.new(0.5, 28, 0.5, 10)
+		p.leftEar.Rotation = -20
+		p.rightEar.Rotation = 20
+	else
+		p.tail.Rotation = -30
+		p.tail.Position = UDim2.new(0.5, 30, 0.5, -8)
+		p.leftEar.Rotation = -10
+		p.rightEar.Rotation = 10
+	end
+
+	p.tongue.BackgroundTransparency = if (state == "active" or state == "playtesting") then 0 else 1
+
+	local showBones = (state == "idle" or state == "disconnected")
+	for _, bone in ipairs(p.bones) do bone.Visible = showBones end
+
+	for _, heart in ipairs(p.hearts) do
+		heart.Visible = (state == "active" or state == "playtesting")
+		if not heart.Visible then heart.TextTransparency = 1 end
+	end
+
+	p.stateLabel.Text = state
+end
+
+-- ============================================================================
+-- Mascot Loader (switches between skins)
+-- ============================================================================
+
+local mascotFrame = nil :: Frame? -- forward declaration, assigned in UI section
+local widget = nil :: any -- forward declaration, assigned in UI section
+local updateStatus = nil :: ((string, string) -> ())? -- forward declaration
+local showToast = nil :: ((string, string?) -> ())? -- forward declaration
+
+local function loadMascot(skinName: string)
+	-- Stop current animations
+	if currentMascotStop then
+		currentMascotStop()
+		currentMascotStop = nil
+	end
+
+	-- Clear existing mascot children (except layout objects)
+	if mascotFrame then
+		for _, child in mascotFrame:GetChildren() do
+			if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+				child:Destroy()
+			end
+		end
+	end
+
+	local skin = MascotRegistry[skinName]
+	if not skin then skin = MascotRegistry.cat; skinName = "cat" end
+
+	currentMascotSkin = skinName
+	currentMascotParts = skin.draw(mascotFrame, theme)
+	-- animate needs widget reference — we'll set it after widget is created
+	return skinName
+end
+
+local function startMascotAnimations()
+	if currentMascotParts and currentMascotSkin then
+		local skin = MascotRegistry[currentMascotSkin]
+		if skin then
+			currentMascotStop = skin.animate(currentMascotParts, function() return pluginState end, function() return running end, widget)
+		end
+	end
+end
+
+local function httpGet(path: string): (boolean, any)
+	local ok, result = pcall(function()
+		return HttpService:GetAsync(serverUrl .. path)
+	end)
+	if ok then
+		local decodeOk, decoded = pcall(function() return HttpService:JSONDecode(result) end)
+		if decodeOk then return true, decoded end
+	end
+	return false, result
+end
+
+local function httpPost(path: string, body: any): (boolean, any)
+	local ok, result = pcall(function()
+		return HttpService:PostAsync(
+			serverUrl .. path,
+			HttpService:JSONEncode(body),
+			Enum.HttpContentType.ApplicationJson
+		)
+	end)
+	if ok then
+		local decodeOk, decoded = pcall(function() return HttpService:JSONDecode(result) end)
+		if decodeOk then return true, decoded end
+	end
+	return false, result
+end
+
+local function applyPartialDiff(diffData)
+	local inst = resolveInstance(diffData.scriptPath)
+	if not inst or not inst:IsA("LuaSourceContainer") then return nil end
+	local oldSource = ScriptEditorService:GetEditorSource(inst)
+	local oldLines = string.split(oldSource, "\n")
+	local result = {}
+	local oldIdx = 1
+	for _, hunk in diffData.hunks do
+		while oldIdx < hunk.startOld do
+			table.insert(result, oldLines[oldIdx])
+			oldIdx += 1
+		end
+		if hunk.status == "accepted" then
+			for _, line in hunk.lines do
+				if line.type == "add" or line.type == "ctx" then table.insert(result, line.content) end
+				if line.type == "del" or line.type == "ctx" then oldIdx += 1 end
+			end
+		else
+			for _, line in hunk.lines do
+				if line.type == "del" or line.type == "ctx" then
+					table.insert(result, oldLines[oldIdx])
+					oldIdx += 1
+				end
+			end
+		end
+	end
+	while oldIdx <= #oldLines do
+		table.insert(result, oldLines[oldIdx])
+		oldIdx += 1
+	end
+	return table.concat(result, "\n")
+end
+
+local function reconstructNewSource(diffData)
+	local inst = resolveInstance(diffData.scriptPath)
+	if not inst or not inst:IsA("LuaSourceContainer") then return nil end
+	local oldSource = ScriptEditorService:GetEditorSource(inst)
+	local oldLines = string.split(oldSource, "\n")
+	local result = {}
+	local oldIdx = 1
+	for _, hunk in diffData.hunks do
+		while oldIdx < hunk.startOld do
+			table.insert(result, oldLines[oldIdx])
+			oldIdx += 1
+		end
+		for _, line in hunk.lines do
+			if line.type == "add" or line.type == "ctx" then table.insert(result, line.content) end
+			if line.type == "del" or line.type == "ctx" then oldIdx += 1 end
+		end
+	end
+	while oldIdx <= #oldLines do
+		table.insert(result, oldLines[oldIdx])
+		oldIdx += 1
+	end
+	return table.concat(result, "\n")
+end
+
+local function archiveDiff(diffId, diffData)
+	local addCount, delCount = 0, 0
+	local acceptedCount, rejectedCount = 0, 0
+	for _, hunk in diffData.hunks do
+		for _, line in hunk.lines do
+			if line.type == "add" then addCount += 1 end
+			if line.type == "del" then delCount += 1 end
+		end
+		if hunk.status == "accepted" then acceptedCount += 1
+		elseif hunk.status == "rejected" then rejectedCount += 1 end
+	end
+
+	local outcome = if rejectedCount == 0 then "accepted"
+		elseif acceptedCount == 0 then "rejected"
+		else "partial"
+
+	table.insert(diffHistory, {
+		id = diffId,
+		scriptPath = diffData.scriptPath or diffData.scriptName or "Unknown",
+		scriptName = diffData.scriptName or "Script",
+		hunks = diffData.hunks,
+		timestamp = diffData.timestamp or os.time(),
+		resolvedAt = os.time(),
+		outcome = outcome,
+		addCount = addCount,
+		delCount = delCount,
+	})
+
+	saveDiffHistory()
+end
+
+-- ============================================================================
+-- Main Widget UI
+-- ============================================================================
+
+widget = plugin:CreateDockWidgetPluginGui(
+	"Linkedsword",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 280, 450, 260, 400)
+)
+widget.Title = "Linkedsword"
+widget.Name = "Linkedsword"
+
+-- ============================================================================
+-- Diff Review Pop-out Window (GitHub-style)
+-- ============================================================================
+
+local LINE_HEIGHT = 22
+local GUTTER_WIDTH = 44 -- line number gutter per side
+local DIFF_BG = Color3.fromRGB(13, 17, 23)
+local DIFF_HEADER_BG = Color3.fromRGB(22, 27, 34)
+local DIFF_BORDER = Color3.fromRGB(48, 54, 61)
+local ADD_BG = Color3.fromRGB(19, 35, 24)
+local ADD_BG_STRONG = Color3.fromRGB(26, 64, 34)
+local DEL_BG = Color3.fromRGB(40, 18, 20)
+local DEL_BG_STRONG = Color3.fromRGB(67, 22, 27)
+local ADD_TEXT = Color3.fromRGB(126, 231, 135)
+local DEL_TEXT = Color3.fromRGB(255, 129, 130)
+local CTX_TEXT = Color3.fromRGB(139, 148, 158)
+local GUTTER_TEXT = Color3.fromRGB(72, 79, 88)
+local HUNK_SEPARATOR_BG = Color3.fromRGB(18, 28, 45)
+local HUNK_SEPARATOR_TEXT = Color3.fromRGB(96, 139, 212)
+
+local diffWidget = plugin:CreateDockWidgetPluginGui(
+	"LSDiffReview",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 720, 500, 500, 350)
+)
+diffWidget.Title = "Linkedsword — Script Diffs"
+diffWidget.Name = "LSDiffReview"
+
+-- Diff window root — no padding, full bleed
+local diffRoot = Instance.new("Frame")
+diffRoot.Name = "DiffRoot"
+diffRoot.Size = UDim2.new(1, 0, 1, 0)
+diffRoot.BackgroundColor3 = DIFF_BG
+diffRoot.BorderSizePixel = 0
+diffRoot.Parent = diffWidget
+
+-- Tab bar for switching between Pending and History views
+local diffViewMode = "pending" -- "pending" | "history"
+local selectedHistoryIdx = nil -- which history entry is being viewed (nil = list)
+
+local tabBar = Instance.new("Frame")
+tabBar.Name = "TabBar"
+tabBar.Size = UDim2.new(1, 0, 0, 36)
+tabBar.BackgroundColor3 = DIFF_HEADER_BG
+tabBar.BorderSizePixel = 0
+tabBar.Parent = diffRoot
+
+local pendingTab = Instance.new("TextButton")
+pendingTab.Name = "PendingTab"
+pendingTab.Size = UDim2.new(0.5, 0, 1, 0)
+pendingTab.BackgroundColor3 = DIFF_BG
+pendingTab.TextColor3 = Color3.fromRGB(201, 209, 217)
+pendingTab.Text = "Pending"
+pendingTab.TextSize = 13
+pendingTab.Font = Enum.Font.GothamBold
+pendingTab.BorderSizePixel = 0
+pendingTab.Parent = tabBar
+
+local historyTab = Instance.new("TextButton")
+historyTab.Name = "HistoryTab"
+historyTab.Size = UDim2.new(0.5, 0, 1, 0)
+historyTab.Position = UDim2.new(0.5, 0, 0, 0)
+historyTab.BackgroundColor3 = DIFF_HEADER_BG
+historyTab.TextColor3 = GUTTER_TEXT
+historyTab.Text = "History (" .. #diffHistory .. ")"
+historyTab.TextSize = 13
+historyTab.Font = Enum.Font.GothamBold
+historyTab.BorderSizePixel = 0
+historyTab.Parent = tabBar
+
+local tabIndicator = Instance.new("Frame")
+tabIndicator.Name = "TabIndicator"
+tabIndicator.Size = UDim2.new(0.5, 0, 0, 2)
+tabIndicator.Position = UDim2.new(0, 0, 1, -2)
+tabIndicator.BackgroundColor3 = rgbFromTable(theme.accent)
+tabIndicator.BorderSizePixel = 0
+tabIndicator.Parent = tabBar
+
+-- Main scroll — below tab bar
+local diffScroll = Instance.new("ScrollingFrame")
+diffScroll.Name = "DiffScroll"
+diffScroll.Size = UDim2.new(1, 0, 1, -36)
+diffScroll.Position = UDim2.new(0, 0, 0, 36)
+diffScroll.BackgroundTransparency = 1
+diffScroll.BorderSizePixel = 0
+diffScroll.ScrollBarThickness = 8
+diffScroll.ScrollBarImageColor3 = Color3.fromRGB(72, 79, 88)
+diffScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+diffScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+diffScroll.Parent = diffRoot
+
+local diffScrollLayout = Instance.new("UIListLayout")
+diffScrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
+diffScrollLayout.Padding = UDim.new(0, 0)
+diffScrollLayout.Parent = diffScroll
+
+-- Empty state (centered)
+local diffEmptyLabel = Instance.new("TextLabel")
+diffEmptyLabel.Name = "EmptyState"
+diffEmptyLabel.Size = UDim2.new(1, 0, 0, 80)
+diffEmptyLabel.BackgroundTransparency = 1
+diffEmptyLabel.Text = "No pending diffs"
+diffEmptyLabel.TextColor3 = CTX_TEXT
+diffEmptyLabel.TextSize = 14
+diffEmptyLabel.Font = Enum.Font.GothamMedium
+diffEmptyLabel.LayoutOrder = 9999
+diffEmptyLabel.Parent = diffScroll
+
+-- ============================================================================
+-- Main Widget Root
+-- ============================================================================
+
+local root = Instance.new("Frame")
+root.Name = "Root"
+root.Size = UDim2.new(1, 0, 1, 0)
+root.BackgroundColor3 = rgbFromTable(theme.background)
+root.BorderSizePixel = 0
+root.Parent = widget
+
+-- Toast notification container (overlays root, ZIndex > root)
+local toastContainer = Instance.new("Frame")
+toastContainer.Name = "ToastContainer"
+toastContainer.Size = UDim2.new(1, -28, 0, 0)
+toastContainer.Position = UDim2.new(0, 14, 0, 12)
+toastContainer.AutomaticSize = Enum.AutomaticSize.Y
+toastContainer.BackgroundTransparency = 1
+toastContainer.ZIndex = 10
+toastContainer.Parent = widget
+
+local toastLayout = Instance.new("UIListLayout")
+toastLayout.SortOrder = Enum.SortOrder.LayoutOrder
+toastLayout.Padding = UDim.new(0, 4)
+toastLayout.Parent = toastContainer
+
+local rootPadding = Instance.new("UIPadding")
+rootPadding.PaddingTop = UDim.new(0, 12)
+rootPadding.PaddingBottom = UDim.new(0, 12)
+rootPadding.PaddingLeft = UDim.new(0, 14)
+rootPadding.PaddingRight = UDim.new(0, 14)
+rootPadding.Parent = root
+
+local rootLayout = Instance.new("UIListLayout")
+rootLayout.SortOrder = Enum.SortOrder.LayoutOrder
+rootLayout.Padding = UDim.new(0, 8)
+rootLayout.Parent = root
+
+-- Header with gear button
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 32)
+header.BackgroundTransparency = 1
+header.LayoutOrder = 0
+header.Parent = root
+
+local headerLayout = Instance.new("UIListLayout")
+headerLayout.FillDirection = Enum.FillDirection.Horizontal
+headerLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+headerLayout.Padding = UDim.new(0, 2)
+headerLayout.Parent = header
+
+-- Linked Sword logo image
+local LOGO_ASSET = "rbxassetid://125013769"
+
+local logoImage = Instance.new("ImageLabel")
+logoImage.Name = "LogoImage"
+logoImage.Size = UDim2.new(0, 28, 0, 28)
+logoImage.BackgroundTransparency = 1
+logoImage.Image = LOGO_ASSET
+logoImage.ScaleType = Enum.ScaleType.Fit
+logoImage.Visible = LOGO_ASSET ~= ""
+logoImage.Parent = header
+
+local logoLabel = Instance.new("TextLabel")
+logoLabel.Name = "Logo"
+logoLabel.Size = UDim2.new(0, if LOGO_ASSET ~= "" then 80 else 100, 1, 0)
+logoLabel.BackgroundTransparency = 1
+logoLabel.Text = if LOGO_ASSET ~= "" then "Linkedsword" else "Linkedsword"
+logoLabel.TextColor3 = rgbFromTable(theme.accent)
+logoLabel.TextSize = 16
+logoLabel.Font = Enum.Font.GothamBold
+logoLabel.TextXAlignment = Enum.TextXAlignment.Left
+logoLabel.Parent = header
+
+local versionLabel = Instance.new("TextLabel")
+versionLabel.Name = "Version"
+versionLabel.Size = UDim2.new(0, 36, 1, 0)
+versionLabel.BackgroundTransparency = 1
+versionLabel.Text = "v" .. PLUGIN_VERSION
+versionLabel.TextColor3 = rgbFromTable(theme.textSecondary)
+versionLabel.TextSize = 11
+versionLabel.Font = Enum.Font.GothamMedium
+versionLabel.TextXAlignment = Enum.TextXAlignment.Left
+versionLabel.Parent = header
+
+local settingsBtn = Instance.new("TextButton")
+settingsBtn.Name = "SettingsBtn"
+settingsBtn.Size = UDim2.new(0, 24, 0, 24)
+settingsBtn.BackgroundColor3 = rgbFromTable(theme.cardBg)
+settingsBtn.BackgroundTransparency = 0.5
+settingsBtn.TextColor3 = rgbFromTable(theme.textSecondary)
+settingsBtn.Text = "⚙"
+settingsBtn.TextSize = 14
+settingsBtn.Font = Enum.Font.GothamBold
+settingsBtn.BorderSizePixel = 0
+settingsBtn.Parent = header
+Instance.new("UICorner", settingsBtn).CornerRadius = UDim.new(0, 4)
+
+-- Status indicator (expandable panel)
+local statusFrame = Instance.new("Frame")
+statusFrame.Name = "Status"
+statusFrame.Size = UDim2.new(1, 0, 0, 0)
+statusFrame.AutomaticSize = Enum.AutomaticSize.Y
+statusFrame.BackgroundColor3 = rgbFromTable(theme.cardBg)
+statusFrame.LayoutOrder = 1
+statusFrame.Parent = root
+Instance.new("UICorner", statusFrame).CornerRadius = UDim.new(0, 6)
+local statusStroke = Instance.new("UIStroke")
+statusStroke.Thickness = 1
+statusStroke.Color = rgbFromTable(theme.border)
+statusStroke.Parent = statusFrame
+
+local statusPadding = Instance.new("UIPadding")
+statusPadding.PaddingTop = UDim.new(0, 6)
+statusPadding.PaddingBottom = UDim.new(0, 6)
+statusPadding.PaddingLeft = UDim.new(0, 8)
+statusPadding.PaddingRight = UDim.new(0, 8)
+statusPadding.Parent = statusFrame
+
+local statusLayout = Instance.new("UIListLayout")
+statusLayout.SortOrder = Enum.SortOrder.LayoutOrder
+statusLayout.Padding = UDim.new(0, 3)
+statusLayout.Parent = statusFrame
+
+-- Top row: dot + status text + latency badge
+local statusTopRow = Instance.new("Frame")
+statusTopRow.Name = "TopRow"
+statusTopRow.Size = UDim2.new(1, 0, 0, 18)
+statusTopRow.BackgroundTransparency = 1
+statusTopRow.LayoutOrder = 0
+statusTopRow.Parent = statusFrame
+
+local statusDot = Instance.new("Frame")
+statusDot.Name = "Dot"
+statusDot.Size = UDim2.new(0, 8, 0, 8)
+statusDot.Position = UDim2.new(0, 0, 0.5, -4)
+statusDot.BackgroundColor3 = rgbFromTable(theme.textSecondary)
+statusDot.Parent = statusTopRow
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+
+local statusText = Instance.new("TextLabel")
+statusText.Name = "Text"
+statusText.Size = UDim2.new(1, -66, 1, 0)
+statusText.Position = UDim2.new(0, 14, 0, 0)
+statusText.BackgroundTransparency = 1
+statusText.Text = "Disconnected"
+statusText.TextColor3 = rgbFromTable(theme.textPrimary)
+statusText.TextSize = 12
+statusText.Font = Enum.Font.GothamMedium
+statusText.TextXAlignment = Enum.TextXAlignment.Left
+statusText.Parent = statusTopRow
+
+local latencyBadge = Instance.new("TextLabel")
+latencyBadge.Name = "Latency"
+latencyBadge.Size = UDim2.new(0, 50, 1, 0)
+latencyBadge.Position = UDim2.new(1, -50, 0, 0)
+latencyBadge.BackgroundTransparency = 1
+latencyBadge.Text = ""
+latencyBadge.TextColor3 = rgbFromTable(theme.textSecondary)
+latencyBadge.TextSize = 9
+latencyBadge.Font = Enum.Font.Code
+latencyBadge.TextXAlignment = Enum.TextXAlignment.Right
+latencyBadge.Visible = false
+latencyBadge.Parent = statusTopRow
+
+-- Detail rows (visible when connected)
+local statusDetails = Instance.new("Frame")
+statusDetails.Name = "Details"
+statusDetails.Size = UDim2.new(1, 0, 0, 0)
+statusDetails.AutomaticSize = Enum.AutomaticSize.Y
+statusDetails.BackgroundTransparency = 1
+statusDetails.LayoutOrder = 1
+statusDetails.Visible = false
+statusDetails.Parent = statusFrame
+
+local detailLayout = Instance.new("UIListLayout")
+detailLayout.SortOrder = Enum.SortOrder.LayoutOrder
+detailLayout.Padding = UDim.new(0, 1)
+detailLayout.Parent = statusDetails
+
+local function createDetailRow(name: string, text: string, order: number): TextLabel
+	local row = Instance.new("TextLabel")
+	row.Name = name
+	row.Size = UDim2.new(1, 0, 0, 14)
+	row.BackgroundTransparency = 1
+	row.Text = text
+	row.TextColor3 = rgbFromTable(theme.textSecondary)
+	row.TextSize = 10
+	row.Font = Enum.Font.Code
+	row.TextXAlignment = Enum.TextXAlignment.Left
+	row.LayoutOrder = order
+	row.Parent = statusDetails
+	return row
+end
+
+local bridgeRow = createDetailRow("Bridge", "HTTP Bridge: Disconnected", 0)
+local serverRow = createDetailRow("Server", "Server: --", 1)
+local modeRow = createDetailRow("Mode", "Mode: --", 2)
+local toolsRow = createDetailRow("Tools", "Tools: --", 3)
+
+local function updateLatencyBadge()
+	if not connected then
+		latencyBadge.Visible = false
+		return
+	end
+	latencyBadge.Visible = true
+	latencyBadge.Text = lastLatencyMs .. "ms"
+	if lastLatencyMs < 200 then
+		latencyBadge.TextColor3 = rgbFromTable(theme.success)
+	elseif lastLatencyMs < 1000 then
+		latencyBadge.TextColor3 = rgbFromTable(theme.warning)
+	else
+		latencyBadge.TextColor3 = rgbFromTable(theme.error)
+	end
+end
+
+local function updateStatusDetails()
+	statusDetails.Visible = connected
+	bridgeRow.Text = "HTTP Bridge: " .. (if connected then "Connected" else "Disconnected")
+	if lastHeartbeatData then
+		serverRow.Text = "Server: v" .. (lastHeartbeatData.serverVersion or "?")
+		local m = lastHeartbeatData.mode or currentMode or "full"
+		modeRow.Text = "Mode: " .. string.upper(string.sub(m, 1, 1)) .. string.sub(m, 2)
+	end
+	updateLatencyBadge()
+end
+
+-- ============================================================================
+-- Server Configuration UI
+-- ============================================================================
+
+local serverSection = Instance.new("Frame")
+serverSection.Name = "ServerConfig"
+serverSection.Size = UDim2.new(1, 0, 0, 0)
+serverSection.AutomaticSize = Enum.AutomaticSize.Y
+serverSection.BackgroundTransparency = 1
+serverSection.LayoutOrder = 2
+serverSection.Parent = root
+
+local serverSectionLayout = Instance.new("UIListLayout")
+serverSectionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+serverSectionLayout.Padding = UDim.new(0, 4)
+serverSectionLayout.Parent = serverSection
+
+local serverLabel = Instance.new("TextLabel")
+serverLabel.Size = UDim2.new(1, 0, 0, 16)
+serverLabel.BackgroundTransparency = 1
+serverLabel.Text = "SERVER"
+serverLabel.TextColor3 = rgbFromTable(theme.textSecondary)
+serverLabel.TextSize = 11
+serverLabel.Font = Enum.Font.GothamBold
+serverLabel.TextXAlignment = Enum.TextXAlignment.Left
+serverLabel.LayoutOrder = 0
+serverLabel.Parent = serverSection
+
+local serverInputFrame = Instance.new("Frame")
+serverInputFrame.Size = UDim2.new(1, 0, 0, 28)
+serverInputFrame.BackgroundColor3 = rgbFromTable(theme.inputBg)
+serverInputFrame.BorderSizePixel = 0
+serverInputFrame.LayoutOrder = 1
+serverInputFrame.Parent = serverSection
+Instance.new("UICorner", serverInputFrame).CornerRadius = UDim.new(0, 6)
+local serverInputStroke = Instance.new("UIStroke")
+serverInputStroke.Thickness = 1
+serverInputStroke.Color = rgbFromTable(theme.muted)
+serverInputStroke.Parent = serverInputFrame
+
+local serverInput = Instance.new("TextBox")
+serverInput.Size = UDim2.new(1, -52, 1, 0)
+serverInput.Position = UDim2.new(0, 6, 0, 0)
+serverInput.BackgroundTransparency = 1
+serverInput.Text = serverUrl
+serverInput.PlaceholderText = "http://127.0.0.1:3002"
+serverInput.PlaceholderColor3 = rgbFromTable(theme.textSecondary)
+serverInput.TextColor3 = rgbFromTable(theme.textPrimary)
+serverInput.TextSize = 12
+serverInput.Font = Enum.Font.Code
+serverInput.TextXAlignment = Enum.TextXAlignment.Left
+serverInput.ClearTextOnFocus = false
+serverInput.Parent = serverInputFrame
+
+local testBtn = Instance.new("TextButton")
+testBtn.Name = "TestBtn"
+testBtn.Size = UDim2.new(0, 36, 0, 20)
+testBtn.Position = UDim2.new(1, -40, 0.5, -10)
+testBtn.BackgroundColor3 = rgbFromTable(theme.cardBg)
+testBtn.TextColor3 = rgbFromTable(theme.textSecondary)
+testBtn.Text = "Test"
+testBtn.TextSize = 10
+testBtn.Font = Enum.Font.GothamMedium
+testBtn.BorderSizePixel = 0
+testBtn.Parent = serverInputFrame
+Instance.new("UICorner", testBtn).CornerRadius = UDim.new(0, 4)
+
+testBtn.Activated:Connect(function()
+	testBtn.Text = "..."
+	local testUrl = serverInput.Text
+	if not testUrl or #testUrl == 0 then testUrl = serverUrl end
+	local ok, result = pcall(function()
+		return HttpService:GetAsync(testUrl .. "/health")
+	end)
+	if ok then
+		local decodeOk, data = pcall(function() return HttpService:JSONDecode(result) end)
+		if decodeOk and data then
+			showToast("Server reachable — v" .. (data.version or "?") .. ", " .. (data.instances or 0) .. " instance(s)", "success")
+			testBtn.Text = "✓"
+			testBtn.TextColor3 = rgbFromTable(theme.success)
+		else
+			showToast("Server responded with invalid data", "error")
+			testBtn.Text = "✗"
+			testBtn.TextColor3 = rgbFromTable(theme.error)
+		end
+	else
+		showToast("Server unreachable at " .. testUrl, "error")
+		testBtn.Text = "✗"
+		testBtn.TextColor3 = rgbFromTable(theme.error)
+	end
+	task.delay(2, function()
+		testBtn.Text = "Test"
+		testBtn.TextColor3 = rgbFromTable(theme.textSecondary)
+	end)
+end)
+
+serverInput.Focused:Connect(function()
+	serverInputStroke.Color = rgbFromTable(theme.accent)
+end)
+
+serverInput.FocusLost:Connect(function()
+	serverInputStroke.Color = rgbFromTable(theme.muted)
+	local newUrl = serverInput.Text
+	if newUrl and #newUrl > 0 then serverUrl = newUrl else serverInput.Text = serverUrl end
+end)
+
+local connectButton = Instance.new("TextButton")
+connectButton.Size = UDim2.new(1, 0, 0, 28)
+connectButton.BackgroundColor3 = rgbFromTable(theme.success)
+connectButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+connectButton.Text = "Connect"
+connectButton.TextSize = 12
+connectButton.Font = Enum.Font.GothamMedium
+connectButton.BorderSizePixel = 0
+connectButton.LayoutOrder = 2
+connectButton.Parent = serverSection
+Instance.new("UICorner", connectButton).CornerRadius = UDim.new(0, 6)
+local connectStroke = Instance.new("UIStroke")
+connectStroke.Thickness = 1
+connectStroke.Color = rgbFromTable(theme.border)
+connectStroke.Parent = connectButton
+
+local function updateConnectButton()
+	if running then
+		connectButton.Text = "Disconnect"
+		connectButton.BackgroundColor3 = rgbFromTable(theme.inputBg)
+		connectButton.TextColor3 = rgbFromTable(theme.error)
+		connectStroke.Color = rgbFromTable(theme.error)
+	else
+		connectButton.Text = "Connect"
+		connectButton.BackgroundColor3 = rgbFromTable(theme.success)
+		connectButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+		connectStroke.Color = rgbFromTable(theme.border)
+	end
+	serverInput.TextEditable = not running
+end
+
+-- ============================================================================
+-- Mascot (Registry-based)
+-- ============================================================================
+
+mascotFrame = Instance.new("Frame")
+mascotFrame.Name = "Mascot"
+mascotFrame.Size = UDim2.new(1, 0, 0, 120)
+mascotFrame.BackgroundTransparency = 1
+mascotFrame.LayoutOrder = 3
+mascotFrame.Visible = settings.showMascot
+mascotFrame.Parent = root
+
+-- Load the saved mascot skin (draw only; animations start after widget is ready)
+loadMascot(settings.mascotSkin or "cat")
+
+-- ============================================================================
+-- Diffs Button (compact, opens pop-out window) — LayoutOrder 4
+-- ============================================================================
+
+local diffBtnFrame = Instance.new("Frame")
+diffBtnFrame.Name = "DiffBtnFrame"
+diffBtnFrame.Size = UDim2.new(1, 0, 0, 28)
+diffBtnFrame.BackgroundTransparency = 1
+diffBtnFrame.LayoutOrder = 4
+diffBtnFrame.Visible = false
+diffBtnFrame.Parent = root
+
+local diffOpenBtn = Instance.new("TextButton")
+diffOpenBtn.Name = "DiffOpenBtn"
+diffOpenBtn.Size = UDim2.new(1, 0, 1, 0)
+diffOpenBtn.BackgroundColor3 = rgbFromTable(theme.background)
+diffOpenBtn.TextColor3 = rgbFromTable(theme.accent)
+diffOpenBtn.Text = "View Diffs (0)"
+diffOpenBtn.TextSize = 11
+diffOpenBtn.Font = Enum.Font.GothamBold
+diffOpenBtn.BorderSizePixel = 0
+diffOpenBtn.Parent = diffBtnFrame
+Instance.new("UICorner", diffOpenBtn).CornerRadius = UDim.new(0, 6)
+local diffBtnStroke = Instance.new("UIStroke")
+diffBtnStroke.Thickness = 1
+diffBtnStroke.Color = rgbFromTable(theme.accent)
+diffBtnStroke.Parent = diffOpenBtn
+
+diffOpenBtn.Activated:Connect(function()
+	diffWidget.Enabled = not diffWidget.Enabled
+end)
+
+-- ============================================================================
+-- Settings Section (hidden by default, toggled by gear button)
+-- ============================================================================
+
+local settingsSection = Instance.new("ScrollingFrame")
+settingsSection.Name = "Settings"
+settingsSection.Size = UDim2.new(1, 0, 0, 300)
+settingsSection.BackgroundTransparency = 1
+settingsSection.LayoutOrder = 4.5
+settingsSection.Visible = false
+settingsSection.BorderSizePixel = 0
+settingsSection.ScrollBarThickness = 4
+settingsSection.ScrollBarImageColor3 = rgbFromTable(theme.textSecondary)
+settingsSection.AutomaticCanvasSize = Enum.AutomaticSize.Y
+settingsSection.CanvasSize = UDim2.new(0, 0, 0, 0)
+settingsSection.Parent = root
+
+local settingsLayout = Instance.new("UIListLayout")
+settingsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+settingsLayout.Padding = UDim.new(0, 4)
+settingsLayout.Parent = settingsSection
+
+local settingsHeader = Instance.new("TextLabel")
+settingsHeader.Size = UDim2.new(1, 0, 0, 16)
+settingsHeader.BackgroundTransparency = 1
+settingsHeader.Text = "SETTINGS"
+settingsHeader.TextColor3 = rgbFromTable(theme.textSecondary)
+settingsHeader.TextSize = 10
+settingsHeader.Font = Enum.Font.GothamBold
+settingsHeader.TextXAlignment = Enum.TextXAlignment.Left
+settingsHeader.LayoutOrder = 0
+settingsHeader.Parent = settingsSection
+
+-- Helper to create a toggle setting row
+local function createToggleSetting(name: string, label: string, default: boolean, order: number, onChange: (boolean) -> ()): TextButton
+	local row = Instance.new("Frame")
+	row.Name = name
+	row.Size = UDim2.new(1, 0, 0, 24)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = order
+	row.Parent = settingsSection
+
+	local rowLabel = Instance.new("TextLabel")
+	rowLabel.Size = UDim2.new(1, -50, 1, 0)
+	rowLabel.BackgroundTransparency = 1
+	rowLabel.Text = label
+	rowLabel.TextColor3 = rgbFromTable(theme.textPrimary)
+	rowLabel.TextSize = 11
+	rowLabel.Font = Enum.Font.GothamMedium
+	rowLabel.TextXAlignment = Enum.TextXAlignment.Left
+	rowLabel.Parent = row
+
+	local toggleBtn = Instance.new("TextButton")
+	toggleBtn.Size = UDim2.new(0, 40, 0, 20)
+	toggleBtn.Position = UDim2.new(1, -40, 0.5, -10)
+	toggleBtn.BackgroundColor3 = if default then rgbFromTable(theme.success) else Color3.fromRGB(63, 63, 70)
+	toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	toggleBtn.Text = if default then "ON" else "OFF"
+	toggleBtn.TextSize = 9
+	toggleBtn.Font = Enum.Font.GothamBold
+	toggleBtn.BorderSizePixel = 0
+	toggleBtn.Parent = row
+	Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 10)
+
+	local isOn = default
+	toggleBtn.Activated:Connect(function()
+		isOn = not isOn
+		toggleBtn.Text = if isOn then "ON" else "OFF"
+		toggleBtn.BackgroundColor3 = if isOn then rgbFromTable(theme.success) else Color3.fromRGB(63, 63, 70)
+		onChange(isOn)
+	end)
+
+	return toggleBtn
+end
+
+-- Helper to create color setting row; returns a refresh(newValues) function
+local colorSettingRefreshers = {} -- collected for reset button
+local function createColorSetting(name: string, label: string, themeKey: string, order: number, onChange: ({ number }) -> ())
+	local default = theme[themeKey]
+	local row = Instance.new("Frame")
+	row.Name = name
+	row.Size = UDim2.new(1, 0, 0, 24)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = order
+	row.Parent = settingsSection
+
+	local rowLabel = Instance.new("TextLabel")
+	rowLabel.Size = UDim2.new(0, 90, 1, 0)
+	rowLabel.BackgroundTransparency = 1
+	rowLabel.Text = label
+	rowLabel.TextColor3 = rgbFromTable(theme.textPrimary)
+	rowLabel.TextSize = 10
+	rowLabel.Font = Enum.Font.GothamMedium
+	rowLabel.TextXAlignment = Enum.TextXAlignment.Left
+	rowLabel.Parent = row
+
+	-- Color preview swatch
+	local swatch = Instance.new("Frame")
+	swatch.Size = UDim2.new(0, 16, 0, 16)
+	swatch.Position = UDim2.new(0, 92, 0.5, -8)
+	swatch.BackgroundColor3 = rgbFromTable(default)
+	swatch.Parent = row
+	Instance.new("UICorner", swatch).CornerRadius = UDim.new(0, 3)
+
+	-- RGB input
+	local inputs = {}
+	for i, ch in ipairs({ "R", "G", "B" }) do
+		local input = Instance.new("TextBox")
+		input.Size = UDim2.new(0, 32, 0, 18)
+		input.Position = UDim2.new(0, 112 + (i - 1) * 36, 0.5, -9)
+		input.BackgroundColor3 = Color3.fromRGB(24, 24, 27)
+		input.TextColor3 = rgbFromTable(theme.textPrimary)
+		input.PlaceholderText = ch
+		input.Text = tostring(default[i])
+		input.TextSize = 9
+		input.Font = Enum.Font.Code
+		input.BorderSizePixel = 0
+		input.ClearTextOnFocus = true
+		input.Parent = row
+		Instance.new("UICorner", input).CornerRadius = UDim.new(0, 3)
+		inputs[i] = input
+
+		input.FocusLost:Connect(function()
+			local val = tonumber(input.Text)
+			if val then
+				val = math.clamp(math.floor(val), 0, 255)
+				input.Text = tostring(val)
+				default[i] = val
+				swatch.BackgroundColor3 = rgbFromTable(default)
+				onChange(default)
+			else
+				input.Text = tostring(default[i])
+			end
+		end)
+	end
+
+	-- Refresh function: syncs UI to current theme[themeKey] after external changes (e.g., reset)
+	local function refresh()
+		default = theme[themeKey]
+		swatch.BackgroundColor3 = rgbFromTable(default)
+		for i, inp in ipairs(inputs) do
+			inp.Text = tostring(default[i])
+		end
+	end
+	table.insert(colorSettingRefreshers, refresh)
+end
+
+-- Helper to create a section header in settings
+local function createSectionHeader(text: string, order: number)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 0, 18)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = "\226\128\148 " .. text .. " \226\128\148"
+	lbl.TextColor3 = rgbFromTable(theme.textSecondary)
+	lbl.TextSize = 9
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.LayoutOrder = order
+	lbl.Parent = settingsSection
+end
+
+-- Helper to create a dropdown setting
+local function createDropdownSetting(name: string, label: string, options: { string }, default: string, order: number, onChange: (string) -> ())
+	local row = Instance.new("Frame")
+	row.Name = name
+	row.Size = UDim2.new(1, 0, 0, 24)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = order
+	row.Parent = settingsSection
+
+	local rowLabel = Instance.new("TextLabel")
+	rowLabel.Size = UDim2.new(1, -90, 1, 0)
+	rowLabel.BackgroundTransparency = 1
+	rowLabel.Text = label
+	rowLabel.TextColor3 = rgbFromTable(theme.textPrimary)
+	rowLabel.TextSize = 11
+	rowLabel.Font = Enum.Font.GothamMedium
+	rowLabel.TextXAlignment = Enum.TextXAlignment.Left
+	rowLabel.Parent = row
+
+	local dropBtn = Instance.new("TextButton")
+	dropBtn.Size = UDim2.new(0, 80, 0, 20)
+	dropBtn.Position = UDim2.new(1, -80, 0.5, -10)
+	dropBtn.BackgroundColor3 = Color3.fromRGB(63, 63, 70)
+	dropBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	dropBtn.Text = default:sub(1, 1):upper() .. default:sub(2)
+	dropBtn.TextSize = 9
+	dropBtn.Font = Enum.Font.GothamBold
+	dropBtn.BorderSizePixel = 0
+	dropBtn.Parent = row
+	Instance.new("UICorner", dropBtn).CornerRadius = UDim.new(0, 6)
+
+	local currentIdx = 1
+	for i, opt in ipairs(options) do
+		if opt == default then currentIdx = i; break end
+	end
+
+	dropBtn.Activated:Connect(function()
+		currentIdx = currentIdx % #options + 1
+		local selected = options[currentIdx]
+		dropBtn.Text = selected:sub(1, 1):upper() .. selected:sub(2)
+		onChange(selected)
+	end)
+end
+
+-- refreshTheme: re-applies all theme-dependent colors globally
+-- Note: some UI elements (feedScroll, feedLabel, feedStroke) are defined later in the file,
+-- so we guard against nil to avoid errors when settings are changed during initialization.
+local function refreshTheme()
+	root.BackgroundColor3 = rgbFromTable(theme.background)
+	logoLabel.TextColor3 = rgbFromTable(theme.accent)
+	statusText.TextColor3 = rgbFromTable(theme.textPrimary)
+	settingsHeader.TextColor3 = rgbFromTable(theme.textSecondary)
+	-- Card backgrounds
+	statusFrame.BackgroundColor3 = rgbFromTable(theme.cardBg)
+	serverInputFrame.BackgroundColor3 = rgbFromTable(theme.inputBg)
+	if feedScroll then feedScroll.BackgroundColor3 = rgbFromTable(theme.cardBg) end
+	-- Section labels
+	serverLabel.TextColor3 = rgbFromTable(theme.textSecondary)
+	if feedLabel then feedLabel.TextColor3 = rgbFromTable(theme.textSecondary) end
+	-- UIStroke borders
+	statusStroke.Color = rgbFromTable(theme.border)
+	serverInputStroke.Color = rgbFromTable(theme.muted)
+	if feedStroke then feedStroke.Color = rgbFromTable(theme.border) end
+	diffBtnStroke.Color = rgbFromTable(theme.accent)
+	-- Button variants
+	diffOpenBtn.BackgroundColor3 = rgbFromTable(theme.background)
+	diffOpenBtn.TextColor3 = rgbFromTable(theme.accent)
+	updateConnectButton()
+	-- Re-apply mascot state with updated theme
+	if currentMascotParts and currentMascotSkin then
+		local skin = MascotRegistry[currentMascotSkin]
+		if skin then skin.updateState(currentMascotParts, pluginState, theme) end
+	end
+	pcall(function() plugin:SetSetting("LSTheme", theme) end)
+end
+
+-- Create settings
+createToggleSetting("ShowMascot", "Show mascot", settings.showMascot, 1, function(val)
+	settings.showMascot = val
+	mascotFrame.Visible = val
+	pcall(function() plugin:SetSetting("LSSettings", settings) end)
+end)
+
+createToggleSetting("AutoAccept", "Auto-accept diffs", settings.autoAccept, 2, function(val)
+	settings.autoAccept = val
+	pcall(function() plugin:SetSetting("LSSettings", settings) end)
+	showToast("Auto-accept " .. (if val then "enabled" else "disabled"), "info")
+end)
+
+createDropdownSetting("MascotSkin", "Mascot skin", { "cat", "robot", "dog" }, settings.mascotSkin or "cat", 3, function(val)
+	settings.mascotSkin = val
+	loadMascot(val)
+	startMascotAnimations()
+	updateStatus(pluginState, statusText.Text)
+	pcall(function() plugin:SetSetting("LSSettings", settings) end)
+end)
+
+-- Theme Colors section
+createSectionHeader("THEME", 9)
+
+createColorSetting("AccentColor", "Accent", "accent", 10, function(val)
+	theme.accent = val; refreshTheme()
+end)
+
+createColorSetting("BgColor", "Background", "background", 11, function(val)
+	theme.background = val; refreshTheme()
+end)
+
+createColorSetting("CardBgColor", "Card bg", "cardBg", 12, function(val)
+	theme.cardBg = val; refreshTheme()
+end)
+
+createColorSetting("TextColor", "Text", "textPrimary", 13, function(val)
+	theme.textPrimary = val; refreshTheme()
+end)
+
+createColorSetting("TextDimColor", "Text dim", "textSecondary", 14, function(val)
+	theme.textSecondary = val; refreshTheme()
+end)
+
+createColorSetting("SuccessColor", "Success", "success", 15, function(val)
+	theme.success = val; refreshTheme()
+end)
+
+createColorSetting("ErrorColor", "Error", "error", 16, function(val)
+	theme.error = val; refreshTheme()
+end)
+
+-- Diff Colors section
+createSectionHeader("DIFFS", 19)
+
+createColorSetting("AddLineColor", "Add line", "addLine", 20, function(val)
+	theme.addLine = val; refreshTheme()
+end)
+
+createColorSetting("DelLineColor", "Del line", "delLine", 21, function(val)
+	theme.delLine = val; refreshTheme()
+end)
+
+createColorSetting("AddBgColor", "Add bg", "addBg", 22, function(val)
+	theme.addBg = val; refreshTheme()
+end)
+
+createColorSetting("DelBgColor", "Del bg", "delBg", 23, function(val)
+	theme.delBg = val; refreshTheme()
+end)
+
+-- Mascot Colors section
+createSectionHeader("MASCOT", 29)
+
+createColorSetting("CatBodyColor", "Body", "catBody", 30, function(val)
+	theme.catBody = val; refreshTheme()
+end)
+
+createColorSetting("CatEyeColor", "Eyes", "catEye", 31, function(val)
+	theme.catEye = val; refreshTheme()
+end)
+
+createColorSetting("CatEarColor", "Ear inner", "catEarInner", 32, function(val)
+	theme.catEarInner = val; refreshTheme()
+end)
+
+createColorSetting("SparkleColor", "Sparkles", "sparkle", 33, function(val)
+	theme.sparkle = val; refreshTheme()
+end)
+
+createColorSetting("SwordGuardColor", "Sword guard", "swordGuard", 34, function(val)
+	theme.swordGuard = val; refreshTheme()
+end)
+
+createColorSetting("SwordGripColor", "Sword grip", "swordGrip", 35, function(val)
+	theme.swordGrip = val; refreshTheme()
+end)
+
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size = UDim2.new(1, 0, 0, 24)
+resetBtn.BackgroundColor3 = Color3.fromRGB(63, 63, 70)
+resetBtn.TextColor3 = rgbFromTable(theme.textPrimary)
+resetBtn.Text = "Reset to Defaults"
+resetBtn.TextSize = 10
+resetBtn.Font = Enum.Font.GothamMedium
+resetBtn.BorderSizePixel = 0
+resetBtn.LayoutOrder = 50
+resetBtn.Parent = settingsSection
+Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 4)
+
+resetBtn.Activated:Connect(function()
+	for k, v in DEFAULT_THEME do
+		theme[k] = { unpack(v) }
+	end
+	-- Refresh all color setting UIs to match new theme values
+	for _, refresh in ipairs(colorSettingRefreshers) do
+		refresh()
+	end
+	refreshTheme()
+end)
+
+-- Toggle settings visibility
+settingsBtn.Activated:Connect(function()
+	settingsSection.Visible = not settingsSection.Visible
+	settingsBtn.BackgroundColor3 = if settingsSection.Visible then rgbFromTable(theme.accent) else rgbFromTable(theme.cardBg)
+end)
+
+-- ============================================================================
+-- Activity Feed (scrolling) — LayoutOrder 5 and 6
+-- ============================================================================
+
+local feedLabel = Instance.new("TextLabel")
+feedLabel.Name = "FeedHeader"
+feedLabel.Size = UDim2.new(1, 0, 0, 20)
+feedLabel.BackgroundTransparency = 1
+feedLabel.Text = "ACTIVITY"
+feedLabel.TextColor3 = rgbFromTable(theme.textSecondary)
+feedLabel.TextSize = 11
+feedLabel.Font = Enum.Font.GothamBold
+feedLabel.TextXAlignment = Enum.TextXAlignment.Left
+feedLabel.LayoutOrder = 5
+feedLabel.Parent = root
+
+local feedScroll = Instance.new("ScrollingFrame")
+feedScroll.Name = "Feed"
+feedScroll.Size = UDim2.new(1, 0, 1, -395)
+feedScroll.BackgroundColor3 = rgbFromTable(theme.cardBg)
+feedScroll.BorderSizePixel = 0
+feedScroll.ScrollBarThickness = 4
+feedScroll.ScrollBarImageColor3 = rgbFromTable(theme.muted)
+feedScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+feedScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+feedScroll.LayoutOrder = 6
+feedScroll.Parent = root
+Instance.new("UICorner", feedScroll).CornerRadius = UDim.new(0, 6)
+local feedStroke = Instance.new("UIStroke")
+feedStroke.Thickness = 1
+feedStroke.Color = rgbFromTable(theme.border)
+feedStroke.Parent = feedScroll
+
+local feedPadding = Instance.new("UIPadding")
+feedPadding.PaddingTop = UDim.new(0, 6)
+feedPadding.PaddingBottom = UDim.new(0, 6)
+feedPadding.PaddingLeft = UDim.new(0, 8)
+feedPadding.PaddingRight = UDim.new(0, 8)
+feedPadding.Parent = feedScroll
+
+local feedLayout = Instance.new("UIListLayout")
+feedLayout.SortOrder = Enum.SortOrder.LayoutOrder
+feedLayout.Padding = UDim.new(0, 1)
+feedLayout.Parent = feedScroll
+
+-- ============================================================================
+-- UI Helper Functions
+-- ============================================================================
+
+local toastOrder = 0
+showToast = function(message: string, toastType: string?)
+	toastType = toastType or "info"
+	toastOrder += 1
+
+	local colorMap = {
+		success = theme.success,
+		error = theme.error,
+		info = theme.accent,
+	}
+	local accentColor = rgbFromTable(colorMap[toastType] or theme.accent)
+
+	local toast = Instance.new("Frame")
+	toast.Name = "Toast_" .. toastOrder
+	toast.Size = UDim2.new(1, 0, 0, 28)
+	toast.BackgroundColor3 = rgbFromTable(theme.cardBg)
+	toast.LayoutOrder = toastOrder
+	toast.ZIndex = 10
+	toast.Parent = toastContainer
+	Instance.new("UICorner", toast).CornerRadius = UDim.new(0, 6)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 1
+	stroke.Color = accentColor
+	stroke.Parent = toast
+
+	local accentBar = Instance.new("Frame")
+	accentBar.Size = UDim2.new(0, 3, 1, -4)
+	accentBar.Position = UDim2.new(0, 2, 0, 2)
+	accentBar.BackgroundColor3 = accentColor
+	accentBar.BorderSizePixel = 0
+	accentBar.ZIndex = 11
+	accentBar.Parent = toast
+	Instance.new("UICorner", accentBar).CornerRadius = UDim.new(0, 2)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -16, 1, 0)
+	label.Position = UDim2.new(0, 12, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = message
+	label.TextColor3 = rgbFromTable(theme.textPrimary)
+	label.TextSize = 10
+	label.Font = Enum.Font.GothamMedium
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.ZIndex = 11
+	label.Parent = toast
+
+	table.insert(activeToasts, toast)
+	while #activeToasts > MAX_VISIBLE_TOASTS do
+		local oldest = table.remove(activeToasts, 1)
+		if oldest and oldest.Parent then oldest:Destroy() end
+	end
+
+	task.delay(3, function()
+		local fadeTween = TweenService:Create(toast, TweenInfo.new(0.3, Enum.EasingStyle.Quad), { BackgroundTransparency = 1 })
+		local labelFade = TweenService:Create(label, TweenInfo.new(0.3), { TextTransparency = 1 })
+		local strokeFade = TweenService:Create(stroke, TweenInfo.new(0.3), { Transparency = 1 })
+		local barFade = TweenService:Create(accentBar, TweenInfo.new(0.3), { BackgroundTransparency = 1 })
+		fadeTween:Play(); labelFade:Play(); strokeFade:Play(); barFade:Play()
+		fadeTween.Completed:Connect(function()
+			toast:Destroy()
+			for i, t in activeToasts do
+				if t == toast then table.remove(activeToasts, i); break end
+			end
+		end)
+	end)
+end
+
+updateStatus = function(state: string, message: string)
+	pluginState = state
+	statusText.Text = message
+
+	local colors = {
+		disconnected = rgbFromTable(theme.textSecondary),
+		idle = Color3.fromRGB(59, 130, 246),
+		active = rgbFromTable(theme.accent),
+		error = rgbFromTable(theme.error),
+		playtesting = rgbFromTable(theme.success),
+	}
+	statusDot.BackgroundColor3 = colors[state] or colors.disconnected
+	updateStatusDetails()
+
+	-- Delegate mascot visuals to the current skin
+	if currentMascotParts and currentMascotSkin then
+		local skin = MascotRegistry[currentMascotSkin]
+		if skin then skin.updateState(currentMascotParts, state, theme) end
+	end
+end
+
+local feedOrder = 0
+local function addFeedEntry(toolName: string, status: string, duration: number?, scriptPath: string?)
+	feedOrder += 1
+	local isScriptTool = scriptPath ~= nil
+
+	local color = status == "success" and rgbFromTable(theme.addLine)
+		or status == "error" and rgbFromTable(theme.delLine)
+		or rgbFromTable(theme.textSecondary)
+
+	-- Outer container: Frame for regular entries, TextButton for script tool entries
+	local entryFrame
+	if isScriptTool then
+		entryFrame = Instance.new("TextButton")
+		entryFrame.Text = ""
+		entryFrame.BorderSizePixel = 0
+		entryFrame.BackgroundColor3 = rgbFromTable(theme.cardBg)
+		entryFrame.BackgroundTransparency = 0.5
+		Instance.new("UICorner", entryFrame).CornerRadius = UDim.new(0, 3)
+		entryFrame.Activated:Connect(function()
+			diffWidget.Enabled = true
+		end)
+	else
+		entryFrame = Instance.new("Frame")
+		entryFrame.BackgroundColor3 = rgbFromTable(theme.cardBg)
+		entryFrame.BackgroundTransparency = if feedOrder % 2 == 0 then 1 else 0.92
+	end
+
+	entryFrame.Name = "Entry_" .. feedOrder
+	entryFrame.Size = UDim2.new(1, 0, 0, 22)
+	entryFrame.LayoutOrder = -feedOrder
+	entryFrame.Parent = feedScroll
+
+	-- Status dot (4px colored circle)
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.Size = UDim2.new(0, 4, 0, 4)
+	dot.Position = UDim2.new(0, 2, 0.5, -2)
+	dot.BackgroundColor3 = color
+	dot.BorderSizePixel = 0
+	dot.Parent = entryFrame
+	Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+	-- Tool name (left-aligned)
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Name = "Name"
+	nameLabel.Size = UDim2.new(1, -95, 1, 0)
+	nameLabel.Position = UDim2.new(0, 10, 0, 0)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = toolName .. (isScriptTool and " ↗" or "")
+	nameLabel.TextColor3 = rgbFromTable(theme.textPrimary)
+	nameLabel.TextSize = 10
+	nameLabel.Font = Enum.Font.Code
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLabel.Parent = entryFrame
+
+	-- Timestamp (right side, dim)
+	local timeLabel = Instance.new("TextLabel")
+	timeLabel.Name = "Time"
+	timeLabel.Size = UDim2.new(0, 30, 1, 0)
+	timeLabel.Position = UDim2.new(1, if duration then -85 else -32, 0, 0)
+	timeLabel.BackgroundTransparency = 1
+	timeLabel.Text = os.date("%H:%M")
+	timeLabel.TextColor3 = rgbFromTable(theme.muted)
+	timeLabel.TextSize = 8
+	timeLabel.Font = Enum.Font.Code
+	timeLabel.TextXAlignment = Enum.TextXAlignment.Right
+	timeLabel.Parent = entryFrame
+
+	-- Duration (right-aligned, muted)
+	if duration then
+		local durLabel = Instance.new("TextLabel")
+		durLabel.Name = "Duration"
+		durLabel.Size = UDim2.new(0, 50, 1, 0)
+		durLabel.Position = UDim2.new(1, -50, 0, 0)
+		durLabel.BackgroundTransparency = 1
+		durLabel.Text = string.format("%.0fms", duration)
+		durLabel.TextColor3 = rgbFromTable(theme.textSecondary)
+		durLabel.TextSize = 9
+		durLabel.Font = Enum.Font.Code
+		durLabel.TextXAlignment = Enum.TextXAlignment.Right
+		durLabel.Parent = entryFrame
+	end
+
+	-- Keep feed bounded
+	local children = feedScroll:GetChildren()
+	local entries = {}
+	for _, child in children do
+		if string.sub(child.Name, 1, 6) == "Entry_" then
+			table.insert(entries, child)
+		end
+	end
+	if #entries > (settings.maxFeedEntries or 100) then
+		table.sort(entries, function(a, b) return a.LayoutOrder > b.LayoutOrder end)
+		for i = (settings.maxFeedEntries or 100) + 1, #entries do
+			entries[i]:Destroy()
+		end
+	end
+end
+
+-- ============================================================================
+-- Diff Review UI Functions (renders into the pop-out diffWidget)
+-- ============================================================================
+
+local function updateDiffBadge()
+	local count = 0
+	for _ in diffQueue do count += 1 end
+	diffOpenBtn.Text = "View Diffs (" .. count .. ")"
+	diffBtnFrame.Visible = count > 0
+	diffEmptyLabel.Visible = (count == 0 and diffViewMode == "pending")
+	historyTab.Text = "History (" .. #diffHistory .. ")"
+end
+
+-- Creates a single diff line row (line number gutters + code content)
+local function createDiffLineRow(lineData, layoutOrder)
+	local row = Instance.new("Frame")
+	row.Name = "Line_" .. layoutOrder
+	row.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+	row.BorderSizePixel = 0
+	row.LayoutOrder = layoutOrder
+
+	local isAdd = lineData.type == "add"
+	local isDel = lineData.type == "del"
+
+	-- Full row background
+	row.BackgroundColor3 = isAdd and ADD_BG or isDel and DEL_BG or DIFF_BG
+
+	-- Old line number gutter
+	local oldGutter = Instance.new("TextLabel")
+	oldGutter.Size = UDim2.new(0, GUTTER_WIDTH, 1, 0)
+	oldGutter.Position = UDim2.new(0, 0, 0, 0)
+	oldGutter.BackgroundColor3 = isAdd and ADD_BG_STRONG or isDel and DEL_BG_STRONG or DIFF_HEADER_BG
+	oldGutter.BackgroundTransparency = 0.5
+	oldGutter.BorderSizePixel = 0
+	oldGutter.Text = if isDel or (not isAdd and lineData.lineOld) then tostring(lineData.lineOld or "") else ""
+	oldGutter.TextColor3 = GUTTER_TEXT
+	oldGutter.TextSize = 12
+	oldGutter.Font = Enum.Font.Code
+	oldGutter.Parent = row
+
+	-- New line number gutter
+	local newGutter = Instance.new("TextLabel")
+	newGutter.Size = UDim2.new(0, GUTTER_WIDTH, 1, 0)
+	newGutter.Position = UDim2.new(0, GUTTER_WIDTH, 0, 0)
+	newGutter.BackgroundColor3 = isAdd and ADD_BG_STRONG or isDel and DEL_BG_STRONG or DIFF_HEADER_BG
+	newGutter.BackgroundTransparency = 0.5
+	newGutter.BorderSizePixel = 0
+	newGutter.Text = if isAdd or (not isDel and lineData.lineNew) then tostring(lineData.lineNew or "") else ""
+	newGutter.TextColor3 = GUTTER_TEXT
+	newGutter.TextSize = 12
+	newGutter.Font = Enum.Font.Code
+	newGutter.Parent = row
+
+	-- +/- prefix
+	local prefix = isAdd and "+" or isDel and "-" or " "
+
+	-- Code content
+	local codeLabel = Instance.new("TextLabel")
+	codeLabel.Size = UDim2.new(1, -(GUTTER_WIDTH * 2 + 8), 1, 0)
+	codeLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
+	codeLabel.BackgroundTransparency = 1
+	codeLabel.Text = prefix .. " " .. (lineData.content or "")
+	codeLabel.TextColor3 = isAdd and ADD_TEXT or isDel and DEL_TEXT or CTX_TEXT
+	codeLabel.TextSize = 13
+	codeLabel.Font = Enum.Font.Code
+	codeLabel.TextXAlignment = Enum.TextXAlignment.Left
+	codeLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	codeLabel.Parent = row
+
+	return row
+end
+
+-- ============================================================================
+-- Diff History UI (renders into diffScroll when History tab is active)
+-- ============================================================================
+
+local function clearDiffScroll()
+	for _, child in diffScroll:GetChildren() do
+		if child:IsA("Frame") or child:IsA("TextButton") or child:IsA("TextLabel") then
+			if child.Name ~= "EmptyState" then child:Destroy() end
+		end
+	end
+end
+
+local renderHistoryUI -- forward declaration
+
+local function renderHistoryDetail(entry)
+	clearDiffScroll()
+	diffEmptyLabel.Visible = false
+
+	local lineOrder = 0
+
+	-- Back button bar
+	lineOrder += 1
+	local backBar = Instance.new("Frame")
+	backBar.Name = "BackBar"
+	backBar.Size = UDim2.new(1, 0, 0, 32)
+	backBar.BackgroundColor3 = DIFF_HEADER_BG
+	backBar.BorderSizePixel = 0
+	backBar.LayoutOrder = lineOrder
+	backBar.Parent = diffScroll
+
+	local backBtn = Instance.new("TextButton")
+	backBtn.Size = UDim2.new(0, 60, 0, 24)
+	backBtn.Position = UDim2.new(0, 8, 0.5, -12)
+	backBtn.BackgroundColor3 = Color3.fromRGB(63, 63, 70)
+	backBtn.TextColor3 = Color3.fromRGB(201, 209, 217)
+	backBtn.Text = "← Back"
+	backBtn.TextSize = 11
+	backBtn.Font = Enum.Font.GothamBold
+	backBtn.BorderSizePixel = 0
+	backBtn.Parent = backBar
+	Instance.new("UICorner", backBtn).CornerRadius = UDim.new(0, 4)
+
+	backBtn.Activated:Connect(function()
+		selectedHistoryIdx = nil
+		renderHistoryUI()
+	end)
+
+	-- File header
+	lineOrder += 1
+	local fileHeader = Instance.new("Frame")
+	fileHeader.Name = "HistoryFileHeader"
+	fileHeader.Size = UDim2.new(1, 0, 0, 36)
+	fileHeader.BackgroundColor3 = DIFF_HEADER_BG
+	fileHeader.BorderSizePixel = 0
+	fileHeader.LayoutOrder = lineOrder
+	fileHeader.Parent = diffScroll
+
+	local fileName = Instance.new("TextLabel")
+	fileName.Size = UDim2.new(1, -160, 1, 0)
+	fileName.Position = UDim2.new(0, 12, 0, 0)
+	fileName.BackgroundTransparency = 1
+	fileName.Text = entry.scriptPath or entry.scriptName or "Script"
+	fileName.TextColor3 = Color3.fromRGB(201, 209, 217)
+	fileName.TextSize = 13
+	fileName.Font = Enum.Font.Code
+	fileName.TextXAlignment = Enum.TextXAlignment.Left
+	fileName.TextTruncate = Enum.TextTruncate.AtEnd
+	fileName.Parent = fileHeader
+
+	local statsLabel = Instance.new("TextLabel")
+	statsLabel.Size = UDim2.new(0, 70, 0, 22)
+	statsLabel.Position = UDim2.new(1, -150, 0.5, -11)
+	statsLabel.BackgroundTransparency = 1
+	statsLabel.RichText = true
+	statsLabel.Text = '<font color="#3fb950">+' .. (entry.addCount or 0) .. '</font>  <font color="#f85149">-' .. (entry.delCount or 0) .. '</font>'
+	statsLabel.TextSize = 12
+	statsLabel.Font = Enum.Font.Code
+	statsLabel.Parent = fileHeader
+
+	local outcomeBadge = Instance.new("TextLabel")
+	outcomeBadge.Size = UDim2.new(0, 56, 0, 22)
+	outcomeBadge.Position = UDim2.new(1, -68, 0.5, -11)
+	outcomeBadge.BackgroundColor3 = if entry.outcome == "accepted" then Color3.fromRGB(35, 134, 54)
+		elseif entry.outcome == "rejected" then Color3.fromRGB(140, 25, 30)
+		else Color3.fromRGB(130, 100, 20)
+	outcomeBadge.TextColor3 = Color3.fromRGB(255, 255, 255)
+	outcomeBadge.Text = if entry.outcome == "accepted" then "Accepted"
+		elseif entry.outcome == "rejected" then "Rejected"
+		else "Partial"
+	outcomeBadge.TextSize = 9
+	outcomeBadge.Font = Enum.Font.GothamBold
+	outcomeBadge.Parent = fileHeader
+	Instance.new("UICorner", outcomeBadge).CornerRadius = UDim.new(0, 4)
+
+	-- Render each hunk
+	if entry.hunks then
+		for hunkIdx, hunk in entry.hunks do
+			lineOrder += 1
+
+			-- Hunk separator
+			local hunkSep = Instance.new("Frame")
+			hunkSep.Name = "HistHunkSep_" .. hunkIdx
+			hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+			hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
+			hunkSep.BorderSizePixel = 0
+			hunkSep.LayoutOrder = lineOrder
+			hunkSep.Parent = diffScroll
+
+			local hunkLabel = Instance.new("TextLabel")
+			hunkLabel.Size = UDim2.new(1, -80, 1, 0)
+			hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
+			hunkLabel.BackgroundTransparency = 1
+			hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld or 0, (hunk.startOld or 0) + #hunk.lines)
+			hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
+			hunkLabel.TextSize = 12
+			hunkLabel.Font = Enum.Font.Code
+			hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
+			hunkLabel.Parent = hunkSep
+
+			-- Read-only status badge
+			local badge = Instance.new("TextLabel")
+			badge.Size = UDim2.new(0, 60, 0, 18)
+			badge.Position = UDim2.new(1, -66, 0.5, -9)
+			badge.BackgroundTransparency = 1
+			badge.Text = if hunk.status == "accepted" then "✓ Accepted" else "✗ Rejected"
+			badge.TextColor3 = if hunk.status == "accepted" then ADD_TEXT else DEL_TEXT
+			badge.TextSize = 10
+			badge.Font = Enum.Font.GothamBold
+			badge.Parent = hunkSep
+
+			-- Render diff lines (reuses createDiffLineRow)
+			for _, line in hunk.lines do
+				lineOrder += 1
+				local lineRow = createDiffLineRow(line, lineOrder)
+				lineRow.Parent = diffScroll
+			end
+		end
+	end
+
+	-- Bottom border
+	lineOrder += 1
+	local bottomBorder = Instance.new("Frame")
+	bottomBorder.Size = UDim2.new(1, 0, 0, 1)
+	bottomBorder.BackgroundColor3 = DIFF_BORDER
+	bottomBorder.BorderSizePixel = 0
+	bottomBorder.LayoutOrder = lineOrder
+	bottomBorder.Parent = diffScroll
+end
+
+renderHistoryUI = function()
+	clearDiffScroll()
+	diffEmptyLabel.Text = if #diffHistory == 0 then "No diff history" else ""
+	diffEmptyLabel.Visible = #diffHistory == 0
+
+	historyTab.Text = "History (" .. #diffHistory .. ")"
+
+	if selectedHistoryIdx then
+		local entry = diffHistory[selectedHistoryIdx]
+		if entry then
+			renderHistoryDetail(entry)
+		else
+			selectedHistoryIdx = nil
+		end
+		return
+	end
+
+	-- Render history list (most recent first)
+	for i = #diffHistory, 1, -1 do
+		local entry = diffHistory[i]
+		local layoutOrder = #diffHistory - i
+
+		local row = Instance.new("TextButton")
+		row.Name = "History_" .. i
+		row.Size = UDim2.new(1, -8, 0, 52)
+		row.Position = UDim2.new(0, 4, 0, 0)
+		row.BackgroundColor3 = DIFF_HEADER_BG
+		row.BorderSizePixel = 0
+		row.LayoutOrder = layoutOrder
+		row.Text = ""
+		row.AutoButtonColor = false
+		row.Parent = diffScroll
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+		-- Outcome icon
+		local outcomeIcon = Instance.new("TextLabel")
+		outcomeIcon.Size = UDim2.new(0, 20, 0, 20)
+		outcomeIcon.Position = UDim2.new(0, 8, 0, 8)
+		outcomeIcon.BackgroundTransparency = 1
+		outcomeIcon.Text = if entry.outcome == "accepted" then "✓"
+			elseif entry.outcome == "rejected" then "✗"
+			else "◐"
+		outcomeIcon.TextColor3 = if entry.outcome == "accepted" then ADD_TEXT
+			elseif entry.outcome == "rejected" then DEL_TEXT
+			else Color3.fromRGB(255, 193, 7)
+		outcomeIcon.TextSize = 14
+		outcomeIcon.Font = Enum.Font.GothamBold
+		outcomeIcon.Parent = row
+
+		-- Script path
+		local pathLabel = Instance.new("TextLabel")
+		pathLabel.Size = UDim2.new(1, -100, 0, 18)
+		pathLabel.Position = UDim2.new(0, 32, 0, 4)
+		pathLabel.BackgroundTransparency = 1
+		pathLabel.Text = entry.scriptPath or entry.scriptName or "Script"
+		pathLabel.TextColor3 = Color3.fromRGB(201, 209, 217)
+		pathLabel.TextSize = 12
+		pathLabel.Font = Enum.Font.Code
+		pathLabel.TextXAlignment = Enum.TextXAlignment.Left
+		pathLabel.TextTruncate = Enum.TextTruncate.AtEnd
+		pathLabel.Parent = row
+
+		-- Stats + timestamp line
+		local statsLine = Instance.new("TextLabel")
+		statsLine.Size = UDim2.new(1, -40, 0, 14)
+		statsLine.Position = UDim2.new(0, 32, 0, 24)
+		statsLine.BackgroundTransparency = 1
+		statsLine.RichText = true
+		local timeStr = os.date("%H:%M", entry.resolvedAt or entry.timestamp)
+		statsLine.Text = '<font color="#3fb950">+' .. (entry.addCount or 0) .. '</font>  <font color="#f85149">-' .. (entry.delCount or 0) .. '</font>  <font color="#484F58">' .. timeStr .. '</font>'
+		statsLine.TextSize = 10
+		statsLine.Font = Enum.Font.Code
+		statsLine.TextXAlignment = Enum.TextXAlignment.Left
+		statsLine.Parent = row
+
+		-- Hunk count badge
+		local hunkCount = if entry.hunks then #entry.hunks else 0
+		local hunkBadge = Instance.new("TextLabel")
+		hunkBadge.Size = UDim2.new(0, 50, 0, 18)
+		hunkBadge.Position = UDim2.new(1, -58, 0.5, -9)
+		hunkBadge.BackgroundTransparency = 1
+		hunkBadge.Text = hunkCount .. (if hunkCount ~= 1 then " hunks" else " hunk")
+		hunkBadge.TextColor3 = GUTTER_TEXT
+		hunkBadge.TextSize = 10
+		hunkBadge.Font = Enum.Font.Code
+		hunkBadge.Parent = row
+
+		-- Click to view detail
+		local capturedIdx = i
+		row.Activated:Connect(function()
+			selectedHistoryIdx = capturedIdx
+			renderHistoryUI()
+		end)
+
+		-- Spacer between entries
+		local spacer = Instance.new("Frame")
+		spacer.Size = UDim2.new(1, 0, 0, 4)
+		spacer.BackgroundTransparency = 1
+		spacer.LayoutOrder = layoutOrder + 0.5
+		spacer.Parent = diffScroll
+	end
+
+	-- Clear History button at the bottom
+	if #diffHistory > 0 then
+		local clearBtn = Instance.new("TextButton")
+		clearBtn.Name = "ClearHistory"
+		clearBtn.Size = UDim2.new(1, -8, 0, 28)
+		clearBtn.Position = UDim2.new(0, 4, 0, 0)
+		clearBtn.BackgroundColor3 = Color3.fromRGB(63, 63, 70)
+		clearBtn.TextColor3 = GUTTER_TEXT
+		clearBtn.Text = "Clear History"
+		clearBtn.TextSize = 11
+		clearBtn.Font = Enum.Font.GothamMedium
+		clearBtn.BorderSizePixel = 0
+		clearBtn.LayoutOrder = #diffHistory + 1
+		clearBtn.Parent = diffScroll
+		Instance.new("UICorner", clearBtn).CornerRadius = UDim.new(0, 6)
+
+		local confirmActive = false
+		clearBtn.Activated:Connect(function()
+			if confirmActive then return end
+			confirmActive = true
+			local count = #diffHistory
+			clearBtn.Text = "Delete " .. count .. " entries?"
+			clearBtn.TextColor3 = rgbFromTable(theme.error)
+
+			local yesBtn = Instance.new("TextButton")
+			yesBtn.Size = UDim2.new(0, 32, 0, 20)
+			yesBtn.Position = UDim2.new(1, -72, 0.5, -10)
+			yesBtn.BackgroundColor3 = rgbFromTable(theme.error)
+			yesBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+			yesBtn.Text = "Yes"
+			yesBtn.TextSize = 10
+			yesBtn.Font = Enum.Font.GothamBold
+			yesBtn.BorderSizePixel = 0
+			yesBtn.ZIndex = 2
+			yesBtn.Parent = clearBtn
+			Instance.new("UICorner", yesBtn).CornerRadius = UDim.new(0, 4)
+
+			local noBtn = Instance.new("TextButton")
+			noBtn.Size = UDim2.new(0, 28, 0, 20)
+			noBtn.Position = UDim2.new(1, -36, 0.5, -10)
+			noBtn.BackgroundColor3 = rgbFromTable(theme.muted)
+			noBtn.TextColor3 = rgbFromTable(theme.textPrimary)
+			noBtn.Text = "No"
+			noBtn.TextSize = 10
+			noBtn.Font = Enum.Font.GothamBold
+			noBtn.BorderSizePixel = 0
+			noBtn.ZIndex = 2
+			noBtn.Parent = clearBtn
+			Instance.new("UICorner", noBtn).CornerRadius = UDim.new(0, 4)
+
+			yesBtn.Activated:Connect(function()
+				diffHistory = {}
+				saveDiffHistory()
+				showToast("Diff history cleared", "info")
+				renderHistoryUI()
+			end)
+
+			noBtn.Activated:Connect(function()
+				yesBtn:Destroy()
+				noBtn:Destroy()
+				clearBtn.Text = "Clear History"
+				clearBtn.TextColor3 = GUTTER_TEXT
+				confirmActive = false
+			end)
+
+			task.delay(3, function()
+				if confirmActive and yesBtn.Parent then
+					yesBtn:Destroy()
+					noBtn:Destroy()
+					clearBtn.Text = "Clear History"
+					clearBtn.TextColor3 = GUTTER_TEXT
+					confirmActive = false
+				end
+			end)
+		end)
+	end
+end
+
+local renderDiffUI -- forward declaration (used by switchToDiffView below)
+
+local function switchToDiffView(mode)
+	diffViewMode = mode
+	selectedHistoryIdx = nil
+	pendingTab.BackgroundColor3 = if mode == "pending" then DIFF_BG else DIFF_HEADER_BG
+	pendingTab.TextColor3 = if mode == "pending" then Color3.fromRGB(201, 209, 217) else GUTTER_TEXT
+	historyTab.BackgroundColor3 = if mode == "history" then DIFF_BG else DIFF_HEADER_BG
+	historyTab.TextColor3 = if mode == "history" then Color3.fromRGB(201, 209, 217) else GUTTER_TEXT
+	tabIndicator.Position = if mode == "pending" then UDim2.new(0, 0, 1, -2) else UDim2.new(0.5, 0, 1, -2)
+
+	if mode == "pending" then
+		renderDiffUI()
+	else
+		renderHistoryUI()
+	end
+end
+
+pendingTab.Activated:Connect(function() switchToDiffView("pending") end)
+historyTab.Activated:Connect(function() switchToDiffView("history") end)
+
+renderDiffUI = function()
+	if diffViewMode ~= "pending" then return end
+
+	-- Clear everything except layout and empty label
+	clearDiffScroll()
+
+	local sectionOrder = 0
+	for diffId, diffData in diffQueue do
+		sectionOrder += 1
+
+		-- Count stats
+		local addCount, delCount = 0, 0
+		for _, hunk in diffData.hunks do
+			for _, line in hunk.lines do
+				if line.type == "add" then addCount += 1 end
+				if line.type == "del" then delCount += 1 end
+			end
+		end
+
+		-- ═══ File header bar (like GitHub's file bar) ═══
+		local fileHeader = Instance.new("Frame")
+		fileHeader.Name = "FileHeader_" .. diffId
+		fileHeader.Size = UDim2.new(1, 0, 0, 36)
+		fileHeader.BackgroundColor3 = DIFF_HEADER_BG
+		fileHeader.BorderSizePixel = 0
+		fileHeader.LayoutOrder = sectionOrder * 1000
+		fileHeader.Parent = diffScroll
+
+		-- File name
+		local fileName = Instance.new("TextLabel")
+		fileName.Size = UDim2.new(1, -220, 1, 0)
+		fileName.Position = UDim2.new(0, 12, 0, 0)
+		fileName.BackgroundTransparency = 1
+		fileName.Text = diffData.scriptPath or diffData.scriptName or "Script"
+		fileName.TextColor3 = Color3.fromRGB(201, 209, 217)
+		fileName.TextSize = 13
+		fileName.Font = Enum.Font.Code
+		fileName.TextXAlignment = Enum.TextXAlignment.Left
+		fileName.TextTruncate = Enum.TextTruncate.AtEnd
+		fileName.Parent = fileHeader
+
+		-- Stats badge
+		local statsLabel = Instance.new("TextLabel")
+		statsLabel.Size = UDim2.new(0, 80, 0, 22)
+		statsLabel.Position = UDim2.new(1, -210, 0.5, -11)
+		statsLabel.BackgroundTransparency = 1
+		statsLabel.RichText = true
+		statsLabel.Text = '<font color="#3fb950">+' .. addCount .. '</font>  <font color="#f85149">-' .. delCount .. '</font>'
+		statsLabel.TextSize = 12
+		statsLabel.Font = Enum.Font.Code
+		statsLabel.Parent = fileHeader
+
+		-- Accept All button (compact)
+		local acceptBtn = Instance.new("TextButton")
+		acceptBtn.Size = UDim2.new(0, 56, 0, 24)
+		acceptBtn.Position = UDim2.new(1, -120, 0.5, -12)
+		acceptBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
+		acceptBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		acceptBtn.Text = "Accept"
+		acceptBtn.TextSize = 11
+		acceptBtn.Font = Enum.Font.GothamBold
+		acceptBtn.BorderSizePixel = 0
+		acceptBtn.Parent = fileHeader
+		Instance.new("UICorner", acceptBtn).CornerRadius = UDim.new(0, 6)
+
+		-- Reject All button (compact)
+		local rejectBtn = Instance.new("TextButton")
+		rejectBtn.Size = UDim2.new(0, 52, 0, 24)
+		rejectBtn.Position = UDim2.new(1, -58, 0.5, -12)
+		rejectBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
+		rejectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		rejectBtn.Text = "Reject"
+		rejectBtn.TextSize = 11
+		rejectBtn.Font = Enum.Font.GothamBold
+		rejectBtn.BorderSizePixel = 0
+		rejectBtn.Parent = fileHeader
+		Instance.new("UICorner", rejectBtn).CornerRadius = UDim.new(0, 6)
+
+		-- ═══ Render each hunk ═══
+		local lineOrder = sectionOrder * 1000
+		for hunkIdx, hunk in diffData.hunks do
+			lineOrder += 1
+
+			-- Hunk separator bar (@@-style)
+			local hunkSep = Instance.new("Frame")
+			hunkSep.Name = "HunkSep_" .. hunkIdx
+			hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+			hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
+			hunkSep.BorderSizePixel = 0
+			hunkSep.LayoutOrder = lineOrder
+			hunkSep.Parent = diffScroll
+
+			local hunkLabel = Instance.new("TextLabel")
+			hunkLabel.Size = UDim2.new(1, -12, 1, 0)
+			hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
+			hunkLabel.BackgroundTransparency = 1
+			hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld, hunk.startOld + #hunk.lines)
+			hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
+			hunkLabel.TextSize = 12
+			hunkLabel.Font = Enum.Font.Code
+			hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
+			hunkLabel.Parent = hunkSep
+
+			-- Per-hunk accept/reject (small, right-aligned in separator)
+			if hunk.status == "pending" then
+				local hAccBtn = Instance.new("TextButton")
+				hAccBtn.Size = UDim2.new(0, 20, 0, 18)
+				hAccBtn.Position = UDim2.new(1, -48, 0.5, -9)
+				hAccBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
+				hAccBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+				hAccBtn.Text = "✓"
+				hAccBtn.TextSize = 11
+				hAccBtn.Font = Enum.Font.GothamBold
+				hAccBtn.BorderSizePixel = 0
+				hAccBtn.Parent = hunkSep
+				Instance.new("UICorner", hAccBtn).CornerRadius = UDim.new(0, 4)
+
+				local hRejBtn = Instance.new("TextButton")
+				hRejBtn.Size = UDim2.new(0, 20, 0, 18)
+				hRejBtn.Position = UDim2.new(1, -24, 0.5, -9)
+				hRejBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
+				hRejBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+				hRejBtn.Text = "✗"
+				hRejBtn.TextSize = 11
+				hRejBtn.Font = Enum.Font.GothamBold
+				hRejBtn.BorderSizePixel = 0
+				hRejBtn.Parent = hunkSep
+				Instance.new("UICorner", hRejBtn).CornerRadius = UDim.new(0, 4)
+
+				local capturedDiffId = diffId
+				local capturedHunkId = hunk.id
+
+				local function checkAllResolved()
+					local allResolved = true
+					for _, h in diffData.hunks do
+						if h.status == "pending" then allResolved = false; break end
+					end
+					if allResolved then
+						local hasAccepted = false
+						for _, h in diffData.hunks do
+							if h.status == "accepted" then hasAccepted = true; break end
+						end
+						if hasAccepted then
+							local finalSource = applyPartialDiff(diffData)
+							if finalSource then
+								local inst = resolveInstance(diffData.scriptPath)
+								if inst and inst:IsA("LuaSourceContainer") then
+									ChangeHistoryService:SetWaypoint("LS:apply diff")
+									ScriptEditorService:UpdateSourceAsync(inst, function() return finalSource end)
+									ChangeHistoryService:SetWaypoint("LS:applied diff")
+								end
+							end
+						end
+						archiveDiff(capturedDiffId, diffData)
+						diffQueue[capturedDiffId] = nil
+					end
+					task.defer(renderDiffUI)
+				end
+
+				hAccBtn.Activated:Connect(function()
+					httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "accept" })
+					hunk.status = "accepted"
+					checkAllResolved()
+				end)
+				hRejBtn.Activated:Connect(function()
+					httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "reject" })
+					hunk.status = "rejected"
+					checkAllResolved()
+				end)
+			elseif hunk.status == "accepted" then
+				local badge = Instance.new("TextLabel")
+				badge.Size = UDim2.new(0, 60, 0, 18)
+				badge.Position = UDim2.new(1, -66, 0.5, -9)
+				badge.BackgroundTransparency = 1
+				badge.Text = "✓ Accepted"
+				badge.TextColor3 = ADD_TEXT
+				badge.TextSize = 10
+				badge.Font = Enum.Font.GothamBold
+				badge.Parent = hunkSep
+			elseif hunk.status == "rejected" then
+				local badge = Instance.new("TextLabel")
+				badge.Size = UDim2.new(0, 60, 0, 18)
+				badge.Position = UDim2.new(1, -66, 0.5, -9)
+				badge.BackgroundTransparency = 1
+				badge.Text = "✗ Rejected"
+				badge.TextColor3 = DEL_TEXT
+				badge.TextSize = 10
+				badge.Font = Enum.Font.GothamBold
+				badge.Parent = hunkSep
+			end
+
+			-- Render lines
+			for _, line in hunk.lines do
+				lineOrder += 1
+				local lineRow = createDiffLineRow(line, lineOrder)
+				lineRow.Parent = diffScroll
+			end
+		end
+
+		-- ═══ Bottom border ═══
+		lineOrder += 1
+		local bottomBorder = Instance.new("Frame")
+		bottomBorder.Size = UDim2.new(1, 0, 0, 1)
+		bottomBorder.BackgroundColor3 = DIFF_BORDER
+		bottomBorder.BorderSizePixel = 0
+		bottomBorder.LayoutOrder = lineOrder
+		bottomBorder.Parent = diffScroll
+
+		-- Spacer between files
+		lineOrder += 1
+		local spacer = Instance.new("Frame")
+		spacer.Size = UDim2.new(1, 0, 0, 16)
+		spacer.BackgroundTransparency = 1
+		spacer.LayoutOrder = lineOrder
+		spacer.Parent = diffScroll
+
+		-- ═══ Wire up file-level accept/reject ═══
+		local capturedDiffId = diffId
+		acceptBtn.Activated:Connect(function()
+			httpPost("/diff/resolve", { diffId = capturedDiffId, action = "accept_all" })
+			for _, h in diffData.hunks do h.status = "accepted" end
+			local inst = resolveInstance(diffData.scriptPath)
+			if inst and inst:IsA("LuaSourceContainer") then
+				local newSource = reconstructNewSource(diffData)
+				if newSource then
+					ChangeHistoryService:SetWaypoint("LS:accept all")
+					ScriptEditorService:UpdateSourceAsync(inst, function() return newSource end)
+					ChangeHistoryService:SetWaypoint("LS:accepted all")
+				end
+			end
+			archiveDiff(capturedDiffId, diffData)
+			diffQueue[capturedDiffId] = nil
+			showToast("Diff accepted: " .. (diffData.scriptName or diffData.scriptPath or "Script"), "success")
+			task.defer(renderDiffUI)
+		end)
+
+		rejectBtn.Activated:Connect(function()
+			httpPost("/diff/resolve", { diffId = capturedDiffId, action = "reject_all" })
+			for _, h in diffData.hunks do h.status = "rejected" end
+			archiveDiff(capturedDiffId, diffData)
+			diffQueue[capturedDiffId] = nil
+			showToast("Diff rejected: " .. (diffData.scriptName or diffData.scriptPath or "Script"), "error")
+			task.defer(renderDiffUI)
+		end)
+	end
+
+	updateDiffBadge()
+end
+
+-- ============================================================================
+-- Request Handlers
+-- ============================================================================
+
+local handlers = {}
+
+handlers["get_file_tree"] = function(params)
+	local treeRoot = game
+	if params.path and params.path ~= "game" then
+		for _, segment in string.split(params.path, ".") do
+			if segment ~= "game" then
+				treeRoot = treeRoot:FindFirstChild(segment)
+				if not treeRoot then return { success = false, error = "Path not found: " .. params.path } end
+			end
+		end
+	end
+	local function buildTree(inst, depth, maxDepth)
+		if maxDepth >= 0 and depth > maxDepth then return nil end
+		local node = { name = inst.Name, className = inst.ClassName, children = {} }
+		for _, child in inst:GetChildren() do
+			local childNode = buildTree(child, depth + 1, maxDepth)
+			if childNode then table.insert(node.children, childNode) end
+		end
+		return node
+	end
+	return { success = true, data = buildTree(treeRoot, 0, params.depth or -1) }
+end
+
+handlers["get_project_structure"] = function()
+	local structure = {}
+	for _, svc in game:GetChildren() do
+		local scriptCount, partCount, totalCount = 0, 0, 0
+		local function countDescendants(inst)
+			totalCount += 1
+			if inst:IsA("LuaSourceContainer") then scriptCount += 1
+			elseif inst:IsA("BasePart") then partCount += 1 end
+			for _, child in inst:GetChildren() do countDescendants(child) end
+		end
+		countDescendants(svc)
+		table.insert(structure, { name = svc.Name, className = svc.ClassName, childCount = #svc:GetChildren(), totalDescendants = totalCount, scriptCount = scriptCount, partCount = partCount })
+	end
+	return { success = true, data = structure }
+end
+
+handlers["get_place_info"] = function()
+	return { success = true, data = { name = game.Name ~= "" and game.Name or "Unnamed Place", placeId = game.PlaceId, gameId = game.GameId, creatorId = game.CreatorId, creatorType = tostring(game.CreatorType) } }
+end
+
+handlers["get_services"] = function()
+	local services = {}
+	for _, svc in game:GetChildren() do
+		table.insert(services, { name = svc.Name, className = svc.ClassName, childCount = #svc:GetChildren() })
+	end
+	return { success = true, data = services }
+end
+
+handlers["search_files"] = function(params)
+	local results = {}
+	local query = string.lower(params.query or "")
+	local function search(inst, path)
+		local fullPath = path .. "." .. inst.Name
+		if string.find(string.lower(inst.Name), query, 1, true) then
+			if not params.classFilter or inst.ClassName == params.classFilter then
+				table.insert(results, { name = inst.Name, path = fullPath, className = inst.ClassName })
+			end
+		end
+		for _, child in inst:GetChildren() do search(child, fullPath) end
+	end
+	for _, svc in game:GetChildren() do search(svc, "game") end
+	return { success = true, data = results }
+end
+
+handlers["search_objects"] = function(params)
+	local searchRoot = game
+	local rootPath = "game"
+	if params.parent then
+		searchRoot = resolveInstance(params.parent)
+		if not searchRoot then return { success = false, error = "Parent not found: " .. params.parent } end
+		rootPath = params.parent
+	end
+	local results = {}
+	local namePattern = params.name and string.lower(params.name) or nil
+	local function search(inst, path)
+		if #results >= 200 then return end
+		local fullPath = path .. "." .. inst.Name
+		local match = true
+		if namePattern and not string.find(string.lower(inst.Name), namePattern, 1, true) then match = false end
+		if params.className and inst.ClassName ~= params.className then match = false end
+		if match and (namePattern or params.className) then
+			table.insert(results, { name = inst.Name, path = fullPath, className = inst.ClassName })
+		end
+		for _, child in inst:GetChildren() do search(child, fullPath) end
+	end
+	for _, child in searchRoot:GetChildren() do search(child, rootPath) end
+	return { success = true, data = results }
+end
+
+handlers["search_by_property"] = function(params)
+	local searchRoot = game
+	local rootPath = "game"
+	if params.parent then
+		searchRoot = resolveInstance(params.parent)
+		if not searchRoot then return { success = false, error = "Parent not found: " .. params.parent } end
+		rootPath = params.parent
+	end
+	local results = {}
+	local function search(inst, path)
+		if #results >= 200 then return end
+		local fullPath = path .. "." .. inst.Name
+		if not params.className or inst.ClassName == params.className then
+			local ok, val = pcall(function() return tostring((inst :: any)[params.propertyName]) end)
+			if ok and val == params.propertyValue then
+				table.insert(results, { name = inst.Name, path = fullPath, className = inst.ClassName, value = val })
+			end
+		end
+		for _, child in inst:GetChildren() do search(child, fullPath) end
+	end
+	for _, child in searchRoot:GetChildren() do search(child, rootPath) end
+	return { success = true, data = results }
+end
+
+handlers["grep_scripts"] = function(params)
+	local results = {}
+	local contextLines = params.contextLines or 2
+	local function searchScript(inst, path)
+		if #results >= 100 then return end
+		local fullPath = path .. "." .. inst.Name
+		if inst:IsA("LuaSourceContainer") then
+			if not params.scriptType or inst.ClassName == params.scriptType then
+				local ok, source = pcall(function() return ScriptEditorService:GetEditorSource(inst) end)
+				if ok and source then
+					local lines = string.split(source, "\n")
+					for lineNum, line in ipairs(lines) do
+						if #results >= 100 then break end
+						if string.find(line, params.pattern, 1, not params.useRegex) then
+							local ctxBefore, ctxAfter = {}, {}
+							for i = math.max(1, lineNum - contextLines), lineNum - 1 do
+								table.insert(ctxBefore, { line = i, content = lines[i] })
+							end
+							for i = lineNum + 1, math.min(#lines, lineNum + contextLines) do
+								table.insert(ctxAfter, { line = i, content = lines[i] })
+							end
+							table.insert(results, { scriptPath = fullPath, scriptName = inst.Name, lineNumber = lineNum, matchLine = line, contextBefore = ctxBefore, contextAfter = ctxAfter })
+						end
+					end
+				end
+			end
+		end
+		for _, child in inst:GetChildren() do searchScript(child, fullPath) end
+	end
+	for _, svc in game:GetChildren() do searchScript(svc, "game") end
+	return { success = true, data = results }
+end
+
+handlers["get_class_info"] = function(params)
+	local ok, tempInst = pcall(Instance.new, params.className)
+	if not ok then return { success = false, error = "Cannot create instance of class: " .. params.className } end
+	local info = { className = params.className, properties = {}, isA = {} }
+	for _, check in { "BasePart", "GuiObject", "LuaSourceContainer", "ValueBase", "Light", "Constraint", "UIBase", "Model", "Tool", "Humanoid" } do
+		local isOk, isResult = pcall(function() return tempInst:IsA(check) end)
+		if isOk and isResult then table.insert(info.isA, check) end
+	end
+	for _, propName in { "Name", "ClassName", "Position", "Size", "CFrame", "BrickColor", "Color", "Material", "Anchored", "CanCollide", "Transparency", "Visible", "Enabled", "Value", "Text", "Font", "TextSize", "Shape", "Reflectance" } do
+		local valOk, val = pcall(function() return (tempInst :: any)[propName] end)
+		if valOk and val ~= nil then info.properties[propName] = { value = tostring(val), type = typeof(val) } end
+	end
+	tempInst:Destroy()
+	return { success = true, data = info }
+end
+
+handlers["mass_get_property"] = function(params)
+	local results = {}
+	for _, path in params.paths do
+		local inst = resolveInstance(path)
+		if inst then
+			local ok, val = pcall(function() return tostring((inst :: any)[params.propertyName]) end)
+			table.insert(results, { path = path, value = ok and val or nil, error = not ok and "Property not readable" or nil })
+		else
+			table.insert(results, { path = path, error = "Not found" })
+		end
+	end
+	return { success = true, data = results }
+end
+
+handlers["get_instance_properties"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. (params.path or "nil") } end
+	local props = {}
+	for _, propName in { "Name", "ClassName", "Parent", "Position", "Size", "CFrame", "BrickColor", "Color", "Material", "Anchored", "CanCollide", "Transparency", "Visible", "Enabled", "Value", "Text", "Font", "TextSize", "TextColor3", "BackgroundColor3", "Source", "MaxHealth", "Health", "WalkSpeed", "JumpPower" } do
+		local valOk, val = pcall(function() return (inst :: any)[propName] end)
+		if valOk and val ~= nil then props[propName] = tostring(val) end
+	end
+	return { success = true, data = props }
+end
+
+handlers["get_instance_children"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. (params.path or "nil") } end
+	local children = {}
+	for _, child in inst:GetChildren() do table.insert(children, { name = child.Name, className = child.ClassName }) end
+	return { success = true, data = children }
+end
+
+handlers["get_selection"] = function()
+	local sel = Selection:Get()
+	local results = {}
+	for _, inst in sel do table.insert(results, { name = inst.Name, className = inst.ClassName, path = getInstancePath(inst) }) end
+	return { success = true, data = results }
+end
+
+handlers["get_script_source"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Script not found: " .. (params.path or "nil") } end
+	if not inst:IsA("LuaSourceContainer") then return { success = false, error = inst.Name .. " is not a script" } end
+	local source = ScriptEditorService:GetEditorSource(inst)
+	local lines = string.split(source, "\n")
+	local numbered = {}
+	for i, line in lines do table.insert(numbered, i .. ": " .. line) end
+	return { success = true, data = { source = source, numberedSource = table.concat(numbered, "\n"), lineCount = #lines } }
+end
+
+handlers["set_script_source_direct"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Script not found: " .. (params.path or "nil") } end
+	if not inst:IsA("LuaSourceContainer") then return { success = false, error = inst.Name .. " is not a script" } end
+	ChangeHistoryService:SetWaypoint("LS:update " .. inst.Name)
+	ScriptEditorService:UpdateSourceAsync(inst, function() return params.source end)
+	ChangeHistoryService:SetWaypoint("LS:updated " .. inst.Name)
+	return { success = true, data = { message = "Script updated: " .. params.path } }
+end
+
+handlers["stage_diff"] = function(params)
+	diffQueue[params.diffId] = params
+	task.defer(function()
+		renderDiffUI()
+		diffWidget.Enabled = true -- Auto-open diff window
+	end)
+	return { success = true, data = { message = "Diff staged", diffId = params.diffId } }
+end
+
+handlers["grep_replace"] = function(params)
+	local affected = {}
+	local totalReplacements = 0
+	local function processScript(inst, path)
+		local fullPath = path .. "." .. inst.Name
+		if inst:IsA("LuaSourceContainer") then
+			if not params.scriptType or inst.ClassName == params.scriptType then
+				local ok, source = pcall(function() return ScriptEditorService:GetEditorSource(inst) end)
+				if ok and source then
+					local newSource, count
+					if params.useRegex then
+						newSource, count = string.gsub(source, params.find, params.replace)
+					else
+						local escaped = string.gsub(params.find, "([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+						newSource, count = string.gsub(source, escaped, params.replace)
+					end
+					if count > 0 then
+						if not params.dryRun then
+							ChangeHistoryService:SetWaypoint("LS:grep_replace " .. inst.Name)
+							ScriptEditorService:UpdateSourceAsync(inst, function() return newSource end)
+							ChangeHistoryService:SetWaypoint("LS:grep_replaced " .. inst.Name)
+						end
+						table.insert(affected, { scriptPath = fullPath, scriptName = inst.Name, replacements = count })
+						totalReplacements += count
+					end
+				end
+			end
+		end
+		for _, child in inst:GetChildren() do processScript(child, fullPath) end
+	end
+	for _, svc in game:GetChildren() do processScript(svc, "game") end
+	return { success = true, data = { scriptsAffected = #affected, totalReplacements = totalReplacements, dryRun = params.dryRun or false, affected = affected } }
+end
+
+handlers["create_object"] = function(params)
+	local parent = resolveInstance(params.parent)
+	if not parent then return { success = false, error = "Parent not found: " .. params.parent } end
+	ChangeHistoryService:SetWaypoint("LS:create " .. params.className)
+	local inst = Instance.new(params.className)
+	if params.name then inst.Name = params.name end
+	if params.properties then
+		for prop, val in params.properties do pcall(function() (inst :: any)[prop] = convertValue(val, prop) end) end
+	end
+	inst.Parent = parent
+	ChangeHistoryService:SetWaypoint("LS:created " .. inst.Name)
+	return { success = true, data = { name = inst.Name, path = getInstancePath(inst), className = inst.ClassName } }
+end
+
+handlers["delete_object"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. (params.path or "nil") } end
+	ChangeHistoryService:SetWaypoint("LS:delete " .. inst.Name)
+	inst:Destroy()
+	ChangeHistoryService:SetWaypoint("LS:deleted")
+	return { success = true, data = { message = "Deleted: " .. params.path } }
+end
+
+handlers["set_property"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. (params.path or "nil") } end
+	local oldVal = nil
+	pcall(function() oldVal = tostring((inst :: any)[params.property]) end)
+	ChangeHistoryService:SetWaypoint("LS:set " .. params.property)
+	local ok, err = pcall(function() (inst :: any)[params.property] = convertValue(params.value, params.property) end)
+	ChangeHistoryService:SetWaypoint("LS:set " .. params.property)
+	if ok then return { success = true, data = { property = params.property, oldValue = oldVal, newValue = tostring(params.value) } }
+	else return { success = false, error = "Failed to set property: " .. tostring(err) } end
+end
+
+handlers["mass_create_objects"] = function(params)
+	ChangeHistoryService:SetWaypoint("LS:mass create start")
+	local created, errors = {}, {}
+	for i, obj in params.objects do
+		local parent = resolveInstance(obj.parent)
+		if not parent then table.insert(errors, { index = i, error = "Parent not found: " .. obj.parent }); continue end
+		local ok, inst = pcall(function()
+			local newInst = Instance.new(obj.className)
+			if obj.name then newInst.Name = obj.name end
+			if obj.properties then for prop, val in obj.properties do pcall(function() (newInst :: any)[prop] = convertValue(val, prop) end) end end
+			newInst.Parent = parent; return newInst
+		end)
+		if ok then table.insert(created, { name = inst.Name, path = getInstancePath(inst), className = inst.ClassName })
+		else table.insert(errors, { index = i, error = tostring(inst) }) end
+	end
+	ChangeHistoryService:SetWaypoint("LS:mass create done")
+	if #errors > 0 and #created == 0 then return { success = false, error = "All creates failed", data = { errors = errors } } end
+	return { success = true, data = { created = created, errors = errors, count = #created } }
+end
+
+handlers["mass_set_property"] = function(params)
+	ChangeHistoryService:SetWaypoint("LS:mass set property start")
+	local updated, errors = 0, {}
+	local convertedVal = convertValue(params.value, params.property)
+	for _, path in params.paths do
+		local inst = resolveInstance(path)
+		if not inst then table.insert(errors, { path = path, error = "Not found" }); continue end
+		local ok, err = pcall(function() (inst :: any)[params.property] = convertedVal end)
+		if ok then updated += 1 else table.insert(errors, { path = path, error = tostring(err) }) end
+	end
+	ChangeHistoryService:SetWaypoint("LS:mass set property done")
+	return { success = true, data = { updated = updated, errors = errors } }
+end
+
+handlers["mass_duplicate"] = function(params)
+	ChangeHistoryService:SetWaypoint("LS:mass duplicate start")
+	local duplicated = {}
+	local count = params.count or 1
+	local offset = params.offset and Vector3.new(params.offset[1], params.offset[2], params.offset[3]) or nil
+	for _, path in params.paths do
+		local inst = resolveInstance(path)
+		if not inst or not inst.Parent then continue end
+		for copyNum = 1, count do
+			local clone = inst:Clone()
+			clone.Name = inst.Name .. "_copy" .. copyNum
+			if offset and clone:IsA("BasePart") then
+				pcall(function() clone.Position = (inst :: any).Position + offset * copyNum end)
+			elseif offset and clone:IsA("Model") and clone.PrimaryPart then
+				pcall(function() clone:PivotTo(inst:GetPivot() * CFrame.new(offset * copyNum)) end)
+			end
+			clone.Parent = inst.Parent
+			table.insert(duplicated, { name = clone.Name, path = getInstancePath(clone) })
+		end
+	end
+	ChangeHistoryService:SetWaypoint("LS:mass duplicate done")
+	return { success = true, data = { duplicated = duplicated, count = #duplicated } }
+end
+
+handlers["smart_duplicate"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. (params.path or "nil") } end
+	ChangeHistoryService:SetWaypoint("LS:smart duplicate start")
+	local results = {}
+	local count, spacing, layout = params.count or 1, params.spacing or 5, params.layout or "grid"
+	local gridCols = math.ceil(math.sqrt(count))
+	for i = 1, count do
+		local clone = inst:Clone()
+		clone.Name = inst.Name .. "_" .. i
+		local offsetPos = Vector3.zero
+		if layout == "line" then offsetPos = Vector3.new(spacing * i, 0, 0)
+		elseif layout == "grid" then offsetPos = Vector3.new(((i-1) % gridCols) * spacing, 0, math.floor((i-1) / gridCols) * spacing)
+		elseif layout == "circle" then local angle = (2 * math.pi * i) / count; offsetPos = Vector3.new(math.cos(angle) * spacing, 0, math.sin(angle) * spacing) end
+		if clone:IsA("BasePart") then pcall(function() clone.Position = (inst :: any).Position + offsetPos end)
+		elseif clone:IsA("Model") and clone.PrimaryPart then pcall(function() clone:PivotTo(inst:GetPivot() * CFrame.new(offsetPos)) end) end
+		clone.Parent = inst.Parent
+		table.insert(results, { name = clone.Name, path = getInstancePath(clone), position = { offsetPos.X, offsetPos.Y, offsetPos.Z } })
+	end
+	ChangeHistoryService:SetWaypoint("LS:smart duplicate done")
+	return { success = true, data = { duplicated = results, count = #results } }
+end
+
+handlers["set_calculated_property"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. (params.path or "nil") } end
+	local ok, currentVal = pcall(function() return (inst :: any)[params.property] end)
+	if not ok then return { success = false, error = "Cannot read property: " .. params.property } end
+	local valType = typeof(currentVal)
+	local valStr = valType == "number" and tostring(currentVal) or valType == "Vector3" and string.format("Vector3.new(%f,%f,%f)", currentVal.X, currentVal.Y, currentVal.Z) or tostring(currentVal)
+	local code = "local current = " .. valStr .. "; return " .. params.formula
+	local fn, compileErr = loadstring(code)
+	if not fn then return { success = false, error = "Formula error: " .. tostring(compileErr) } end
+	local calcOk, newVal = pcall(fn)
+	if not calcOk then return { success = false, error = "Formula runtime error: " .. tostring(newVal) } end
+	ChangeHistoryService:SetWaypoint("LS:calculated set " .. params.property)
+	local setOk, setErr = pcall(function() (inst :: any)[params.property] = newVal end)
+	ChangeHistoryService:SetWaypoint("LS:calculated set done")
+	if setOk then return { success = true, data = { property = params.property, oldValue = tostring(currentVal), newValue = tostring(newVal) } }
+	else return { success = false, error = "Failed to set: " .. tostring(setErr) } end
+end
+
+handlers["execute_luau"] = function(params) return executeLuau(params.code) end
+handlers["run_code"] = function(params) return executeLuau(params.code) end
+handlers["start_playtest"] = function(params)
+	local mode = params and params.mode or "play"
+	if RunService:IsRunning() then return { success = false, error = "A playtest is already running. Stop it first." } end
+	playtestLogs = {}
+	playtestStartTime = os.clock()
+	if logConnection then logConnection:Disconnect() end
+	logConnection = LogService.MessageOut:Connect(function(message, messageType)
+		table.insert(playtestLogs, {
+			type = if messageType == Enum.MessageType.MessageError then "error"
+				elseif messageType == Enum.MessageType.MessageWarning then "warning"
+				else "output",
+			message = message,
+			timestamp = os.clock() - playtestStartTime,
+		})
+	end)
+	local ok, err = pcall(function()
+		if mode == "run" then
+			RunService:Run()
+		else
+			-- "play" and "server" both use plugin play
+			local toolbar = plugin:GetToolbar("LSPlaytest")
+			if toolbar then
+				-- Fallback: use RunService for "run" mode
+				RunService:Run()
+			else
+				RunService:Run()
+			end
+		end
+	end)
+	if not ok then
+		-- Fallback: try via executeLuau which has broader access
+		executeLuau("game:GetService('RunService'):Run()")
+	end
+	pluginState = "playtesting"
+	return { success = true, data = { message = "Playtest started in " .. mode .. " mode" } }
+end
+
+handlers["stop_playtest"] = function()
+	if not RunService:IsRunning() and not RunService:IsRunMode() then
+		return { success = false, error = "No playtest is running." }
+	end
+	local duration = os.clock() - playtestStartTime
+	pcall(function() RunService:Stop() end)
+	if not RunService:IsRunning() then
+		executeLuau("game:GetService('RunService'):Stop()")
+	end
+	if logConnection then logConnection:Disconnect(); logConnection = nil end
+	local errors = {}
+	for _, log in playtestLogs do
+		if log.type == "error" then table.insert(errors, log.message) end
+	end
+	local output = playtestLogs
+	playtestLogs = {}
+	pluginState = "idle"
+	return { success = true, data = { output = output, errors = errors, duration = duration } }
+end
+
+handlers["get_playtest_output"] = function(params)
+	local since = params and params.since or 0
+	local filtered = {}
+	for _, log in playtestLogs do
+		if log.timestamp > since then table.insert(filtered, log) end
+	end
+	return { success = true, data = { logs = filtered, isRunning = RunService:IsRunning() } }
+end
+
+handlers["run_script_in_play_mode"] = function(params)
+	if not RunService:IsRunning() then
+		local startResult = handlers["start_playtest"]({ mode = "run" })
+		if not startResult.success then return startResult end
+		local elapsed = 0
+		while not RunService:IsRunning() and elapsed < 5 do task.wait(0.1); elapsed += 0.1 end
+	end
+	local result = executeLuau(params.code)
+	task.wait(0.5)
+	local stopResult = handlers["stop_playtest"]()
+	return {
+		success = result.success,
+		data = {
+			output = result.data and result.data.output or "",
+			errors = stopResult.data and stopResult.data.errors or {},
+			duration = stopResult.data and stopResult.data.duration or 0,
+		},
+	}
+end
+
+handlers["user_keyboard_input"] = function(params)
+	if not RunService:IsRunning() then return { success = false, error = "Keyboard input requires an active play session." } end
+	if not params or not params.key then return { success = false, error = "Missing required parameter: key" } end
+	local key = params.key
+	local action = params.action or "press"
+	local duration = params.duration or 100
+	local code
+	if action == "press" then
+		code = string.format("local VIM=game:GetService('VirtualInputManager') VIM:SendKeyEvent(true,Enum.KeyCode.%s,false,game) task.wait(0.05) VIM:SendKeyEvent(false,Enum.KeyCode.%s,false,game) print('Key pressed: %s')", key, key, key)
+	elseif action == "hold" then
+		code = string.format("local VIM=game:GetService('VirtualInputManager') VIM:SendKeyEvent(true,Enum.KeyCode.%s,false,game) task.wait(%f) VIM:SendKeyEvent(false,Enum.KeyCode.%s,false,game) print('Key held: %s for %dms')", key, duration / 1000, key, key, duration)
+	elseif action == "release" then
+		code = string.format("local VIM=game:GetService('VirtualInputManager') VIM:SendKeyEvent(false,Enum.KeyCode.%s,false,game) print('Key released: %s')", key, key)
+	else
+		return { success = false, error = "Invalid action: " .. tostring(action) }
+	end
+	return executeLuau(code)
+end
+
+handlers["user_mouse_input"] = function(params)
+	if not RunService:IsRunning() then return { success = false, error = "Mouse input requires an active play session." } end
+	local action = params.action or "click"
+	local x, y = params.x or 0, params.y or 0
+	local buttonNum = if params.button == "right" then 1 elseif params.button == "middle" then 2 else 0
+	local code
+	if action == "click" then
+		code = string.format("local VIM=game:GetService('VirtualInputManager') VIM:SendMouseButtonEvent(%d,%d,%d,true,game,0) task.wait(0.05) VIM:SendMouseButtonEvent(%d,%d,%d,false,game,0) print('Mouse clicked at %d,%d')", x, y, buttonNum, x, y, buttonNum, x, y)
+	elseif action == "move" then
+		code = string.format("local VIM=game:GetService('VirtualInputManager') VIM:SendMouseMoveEvent(%d,%d,game) print('Mouse moved to %d,%d')", x, y, x, y)
+	elseif action == "scroll" then
+		code = string.format("local VIM=game:GetService('VirtualInputManager') VIM:SendMouseWheelEvent(%d,%d,true,game) print('Mouse scrolled at %d,%d')", x, y, x, y)
+	else
+		return { success = false, error = "Invalid action: " .. tostring(action) }
+	end
+	return executeLuau(code)
+end
+
+handlers["character_navigation"] = function(params)
+	if not RunService:IsRunning() then return { success = false, error = "Character navigation requires an active play session." } end
+	local targetPos
+	if type(params.target) == "table" then targetPos = Vector3.new(params.target[1], params.target[2], params.target[3])
+	else
+		local target = resolveInstance(tostring(params.target))
+		if not target then return { success = false, error = "Target not found" } end
+		local posOk, pos = pcall(function() return (target :: any).Position end)
+		if not posOk then return { success = false, error = "Target has no Position" } end
+		targetPos = pos
+	end
+	return executeLuau(string.format("local PathfindingService=game:GetService('PathfindingService') local Players=game:GetService('Players') local char=Players.LocalPlayer and Players.LocalPlayer.Character if not char then print('ERROR:No character') return end local humanoid=char:FindFirstChildOfClass('Humanoid') if not humanoid then print('ERROR:No humanoid') return end local path=PathfindingService:CreatePath() path:ComputeAsync(char.PrimaryPart.Position,Vector3.new(%f,%f,%f)) if path.Status==Enum.PathStatus.Success then for _,wp in path:GetWaypoints() do humanoid:MoveTo(wp.Position) humanoid.MoveToFinished:Wait() end print('REACHED') else print('ERROR:Path failed') end", targetPos.X, targetPos.Y, targetPos.Z))
+end
+
+handlers["get_studio_mode"] = function()
+	local mode = "edit"
+	if RunService:IsRunning() then mode = RunService:IsServer() and "server" or "play" end
+	return { success = true, data = { mode = mode } }
+end
+
+handlers["rollback"] = function(params)
+	local count = params.count or 1
+	for _ = 1, count do ChangeHistoryService:Undo() end
+	return { success = true, data = { message = "Rolled back " .. count .. " step(s)" } }
+end
+
+handlers["get_tags"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	return { success = true, data = CollectionService:GetTags(inst) }
+end
+
+handlers["get_tagged"] = function(params)
+	local tagged = CollectionService:GetTagged(params.tag)
+	local results = {}
+	for _, inst in tagged do table.insert(results, { name = inst.Name, path = getInstancePath(inst), className = inst.ClassName }) end
+	return { success = true, data = results }
+end
+
+handlers["get_attribute"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found" } end
+	local val = inst:GetAttribute(params.name)
+	if val == nil then return { success = false, error = "Attribute not found: " .. params.name } end
+	return { success = true, data = { name = params.name, value = tostring(val), type = typeof(val) } }
+end
+
+handlers["get_attributes"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found" } end
+	local attrs = inst:GetAttributes()
+	local result = {}
+	for name, val in attrs do result[name] = { value = tostring(val), type = typeof(val) } end
+	return { success = true, data = result }
+end
+
+handlers["capture_screenshot"] = function()
+	-- Graceful degradation: try to capture, fall back to camera info
+	local camera = workspace.CurrentCamera
+	if not camera then return { success = false, error = "No active camera" } end
+	local info = {
+		position = { camera.CFrame.Position.X, camera.CFrame.Position.Y, camera.CFrame.Position.Z },
+		lookVector = { camera.CFrame.LookVector.X, camera.CFrame.LookVector.Y, camera.CFrame.LookVector.Z },
+		fieldOfView = camera.FieldOfView,
+		viewportSize = { camera.ViewportSize.X, camera.ViewportSize.Y },
+	}
+	-- Try pixel capture via EditableImage (Studio 2024.2+)
+	local ok, imgData = pcall(function()
+		local size = Vector2.new(320, 240)
+		local img = Instance.new("EditableImage")
+		img.Size = size
+		local vf = Instance.new("ViewportFrame")
+		vf.Size = UDim2.fromOffset(320, 240)
+		vf.CurrentCamera = camera
+		vf.Parent = CoreGui
+		task.wait(0.1)
+		local pixels = img:ReadPixels(Vector2.zero, size)
+		vf:Destroy()
+		img:Destroy()
+		return pixels
+	end)
+	if ok and imgData then
+		info.pixelData = "captured"
+		info.resolution = { 320, 240 }
+	else
+		info.pixelData = nil
+		info.note = "Pixel capture unavailable — returning camera metadata only"
+		-- Add visible objects in view
+		local visibleObjects = {}
+		for _, obj in workspace:GetChildren() do
+			if obj:IsA("BasePart") or obj:IsA("Model") then
+				table.insert(visibleObjects, { name = obj.Name, className = obj.ClassName })
+			end
+		end
+		info.visibleObjects = visibleObjects
+	end
+	return { success = true, data = info }
+end
+
+handlers["export_build"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found" } end
+	local function serialize(obj)
+		local node = { className = obj.ClassName, name = obj.Name, properties = {}, children = {} }
+		for _, p in { "Position", "Size", "CFrame", "Color", "BrickColor", "Material", "Anchored", "CanCollide", "Transparency", "Visible", "Value", "Text" } do
+			local ok, v = pcall(function() return (obj :: any)[p] end)
+			if ok and v ~= nil then node.properties[p] = tostring(v) end
+		end
+		if obj:IsA("LuaSourceContainer") then
+			local srcOk, src = pcall(function() return ScriptEditorService:GetEditorSource(obj) end)
+			if srcOk then node.properties["Source"] = src end
+		end
+		for _, child in obj:GetChildren() do table.insert(node.children, serialize(child)) end
+		return node
+	end
+	local buildData = serialize(inst)
+	local library = plugin:GetSetting("LSBuildLibrary") or {}
+	library[params.name] = { data = buildData, description = params.description or "", timestamp = os.time(), instanceCount = #inst:GetDescendants() + 1 }
+	local saveOk = pcall(function() plugin:SetSetting("LSBuildLibrary", library) end)
+	if not saveOk then return { success = false, error = "Failed to save — data may be too large." } end
+	return { success = true, data = { buildId = params.name, name = params.name, instanceCount = #inst:GetDescendants() + 1 } }
+end
+
+handlers["import_build"] = function(params)
+	local library = plugin:GetSetting("LSBuildLibrary") or {}
+	local entry = library[params.name]
+	if not entry then return { success = false, error = "Build not found: " .. params.name } end
+	local parentPath = params.parent or "game.Workspace"
+	local parent = resolveInstance(parentPath)
+	if not parent then return { success = false, error = "Parent not found: " .. parentPath } end
+	ChangeHistoryService:SetWaypoint("LS:import build " .. params.name)
+	local function reconstruct(data, parentInst)
+		local ok, inst = pcall(Instance.new, data.className)
+		if not ok then return nil end
+		inst.Name = data.name
+		for prop, val in data.properties do pcall(function() (inst :: any)[prop] = val end) end
+		inst.Parent = parentInst
+		for _, childData in data.children do reconstruct(childData, inst) end
+		return inst
+	end
+	local importedRoot = reconstruct(entry.data, parent)
+	ChangeHistoryService:SetWaypoint("LS:imported build " .. params.name)
+	if importedRoot then return { success = true, data = { name = importedRoot.Name, path = getInstancePath(importedRoot) } }
+	else return { success = false, error = "Failed to reconstruct build" } end
+end
+
+handlers["list_library"] = function()
+	local library = plugin:GetSetting("LSBuildLibrary") or {}
+	local results = {}
+	for name, entry in library do table.insert(results, { name = name, description = entry.description, instanceCount = entry.instanceCount, timestamp = entry.timestamp }) end
+	return { success = true, data = results }
+end
+
+handlers["insert_model"] = function(params)
+	ChangeHistoryService:SetWaypoint("LS:insert model")
+	local ok, model = pcall(function() return InsertService:LoadAsset(params.assetId) end)
+	if not ok then return { success = false, error = "Failed to load asset: " .. tostring(model) } end
+	local firstName = "Model"
+	for _, child in model:GetChildren() do firstName = child.Name; child.Parent = game.Workspace end
+	model:Destroy()
+	ChangeHistoryService:SetWaypoint("LS:inserted model")
+	return { success = true, data = { name = firstName, path = "game.Workspace." .. firstName } }
+end
+
+-- ============================================================================
+-- Phase 2: Instance Manipulation Tools
+-- ============================================================================
+
+handlers["set_selection"] = function(params)
+	if not params or not params.paths then return { success = false, error = "Missing required parameter: paths" } end
+	local instances = {}
+	local notFound = {}
+	for _, path in params.paths do
+		local inst = resolveInstance(path)
+		if inst then table.insert(instances, inst)
+		else table.insert(notFound, path) end
+	end
+	Selection:Set(instances)
+	return { success = true, data = { selected = #instances, notFound = notFound } }
+end
+
+handlers["clone_object"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found: " .. tostring(params.path) } end
+	ChangeHistoryService:SetWaypoint("LS:clone " .. inst.Name)
+	local clone = inst:Clone()
+	if params.name then clone.Name = params.name end
+	local parent = if params.parent then resolveInstance(params.parent) else inst.Parent
+	if not parent then return { success = false, error = "Parent not found" } end
+	clone.Parent = parent
+	ChangeHistoryService:SetWaypoint("LS:cloned " .. clone.Name)
+	return { success = true, data = { name = clone.Name, path = getInstancePath(clone), className = clone.ClassName } }
+end
+
+handlers["reparent_object"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found: " .. tostring(params.path) } end
+	local newParent = resolveInstance(params.newParent)
+	if not newParent then return { success = false, error = "New parent not found: " .. tostring(params.newParent) } end
+	ChangeHistoryService:SetWaypoint("LS:reparent " .. inst.Name)
+	local oldPath = getInstancePath(inst)
+	inst.Parent = newParent
+	ChangeHistoryService:SetWaypoint("LS:reparented " .. inst.Name)
+	return { success = true, data = { name = inst.Name, oldPath = oldPath, newPath = getInstancePath(inst) } }
+end
+
+handlers["group_objects"] = function(params)
+	if not params or not params.paths then return { success = false, error = "Missing required parameter: paths" } end
+	local containerType = params.containerType or "Model"
+	local instances = {}
+	for _, path in params.paths do
+		local inst = resolveInstance(path)
+		if inst then table.insert(instances, inst) end
+	end
+	if #instances == 0 then return { success = false, error = "No valid instances found" } end
+	ChangeHistoryService:SetWaypoint("LS:group objects")
+	local group = Instance.new(containerType)
+	group.Name = params.name or "Group"
+	group.Parent = instances[1].Parent
+	for _, inst in instances do inst.Parent = group end
+	ChangeHistoryService:SetWaypoint("LS:grouped objects")
+	return { success = true, data = { name = group.Name, path = getInstancePath(group), childCount = #instances } }
+end
+
+handlers["ungroup_objects"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	ChangeHistoryService:SetWaypoint("LS:ungroup " .. inst.Name)
+	local parent = inst.Parent
+	local children = inst:GetChildren()
+	local moved = {}
+	for _, child in children do
+		child.Parent = parent
+		table.insert(moved, { name = child.Name, path = getInstancePath(child) })
+	end
+	inst:Destroy()
+	ChangeHistoryService:SetWaypoint("LS:ungrouped")
+	return { success = true, data = { moved = moved, count = #moved } }
+end
+
+-- ============================================================================
+-- Phase 3: Attribute & Tag Write Tools
+-- ============================================================================
+
+handlers["set_attribute"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	ChangeHistoryService:SetWaypoint("LS:set attribute " .. params.name)
+	local val = convertValue(params.value, nil)
+	inst:SetAttribute(params.name, val)
+	ChangeHistoryService:SetWaypoint("LS:set attribute done")
+	return { success = true, data = { name = params.name, value = tostring(val), type = typeof(val) } }
+end
+
+handlers["delete_attribute"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	ChangeHistoryService:SetWaypoint("LS:delete attribute " .. params.name)
+	inst:SetAttribute(params.name, nil)
+	ChangeHistoryService:SetWaypoint("LS:deleted attribute")
+	return { success = true, data = { message = "Deleted attribute: " .. params.name } }
+end
+
+handlers["add_tag"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	ChangeHistoryService:SetWaypoint("LS:add tag " .. params.tag)
+	CollectionService:AddTag(inst, params.tag)
+	ChangeHistoryService:SetWaypoint("LS:added tag")
+	return { success = true, data = { tag = params.tag, path = params.path } }
+end
+
+handlers["remove_tag"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	ChangeHistoryService:SetWaypoint("LS:remove tag " .. params.tag)
+	CollectionService:RemoveTag(inst, params.tag)
+	ChangeHistoryService:SetWaypoint("LS:removed tag")
+	return { success = true, data = { tag = params.tag, path = params.path } }
+end
+
+-- ============================================================================
+-- Phase 4: Script Line-Editing Tools
+-- ============================================================================
+
+handlers["edit_script_lines"] = function(params)
+	if not params or not params.path or not params.startLine or not params.endLine or not params.newContent then
+		return { success = false, error = "Missing required parameters: path, startLine, endLine, newContent" }
+	end
+	local inst = resolveInstance(params.path)
+	if not inst or not inst:IsA("LuaSourceContainer") then return { success = false, error = "Script not found" } end
+	local source = ScriptEditorService:GetEditorSource(inst)
+	local lines = string.split(source, "\n")
+	local startLine = math.max(1, params.startLine)
+	local endLine = math.min(#lines, params.endLine)
+	local newLines = string.split(params.newContent, "\n")
+	local result = {}
+	for i = 1, startLine - 1 do table.insert(result, lines[i]) end
+	for _, line in newLines do table.insert(result, line) end
+	for i = endLine + 1, #lines do table.insert(result, lines[i]) end
+	ChangeHistoryService:SetWaypoint("LS:edit lines " .. startLine .. "-" .. endLine)
+	ScriptEditorService:UpdateSourceAsync(inst, function() return table.concat(result, "\n") end)
+	ChangeHistoryService:SetWaypoint("LS:edited lines")
+	return { success = true, data = { path = params.path, linesReplaced = endLine - startLine + 1, newLineCount = #newLines } }
+end
+
+handlers["insert_script_lines"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst or not inst:IsA("LuaSourceContainer") then return { success = false, error = "Script not found" } end
+	local source = ScriptEditorService:GetEditorSource(inst)
+	local lines = string.split(source, "\n")
+	local afterLine = math.clamp(params.afterLine or 0, 0, #lines)
+	local newLines = string.split(params.content, "\n")
+	local result = {}
+	for i = 1, afterLine do table.insert(result, lines[i]) end
+	for _, line in newLines do table.insert(result, line) end
+	for i = afterLine + 1, #lines do table.insert(result, lines[i]) end
+	ChangeHistoryService:SetWaypoint("LS:insert lines after " .. afterLine)
+	ScriptEditorService:UpdateSourceAsync(inst, function() return table.concat(result, "\n") end)
+	ChangeHistoryService:SetWaypoint("LS:inserted lines")
+	return { success = true, data = { path = params.path, insertedAfter = afterLine, linesInserted = #newLines } }
+end
+
+handlers["delete_script_lines"] = function(params)
+	if not params or not params.path or not params.startLine or not params.endLine then
+		return { success = false, error = "Missing required parameters: path, startLine, endLine" }
+	end
+	local inst = resolveInstance(params.path)
+	if not inst or not inst:IsA("LuaSourceContainer") then return { success = false, error = "Script not found" } end
+	local source = ScriptEditorService:GetEditorSource(inst)
+	local lines = string.split(source, "\n")
+	local startLine = math.max(1, params.startLine)
+	local endLine = math.min(#lines, params.endLine)
+	local result = {}
+	for i = 1, startLine - 1 do table.insert(result, lines[i]) end
+	for i = endLine + 1, #lines do table.insert(result, lines[i]) end
+	ChangeHistoryService:SetWaypoint("LS:delete lines " .. startLine .. "-" .. endLine)
+	ScriptEditorService:UpdateSourceAsync(inst, function() return table.concat(result, "\n") end)
+	ChangeHistoryService:SetWaypoint("LS:deleted lines")
+	return { success = true, data = { path = params.path, linesDeleted = endLine - startLine + 1 } }
+end
+
+-- ============================================================================
+-- Phase 5: Spatial & Terrain Tools
+-- ============================================================================
+
+handlers["create_weld"] = function(params)
+	local part0 = resolveInstance(params.part0)
+	local part1 = resolveInstance(params.part1)
+	if not part0 or not part0:IsA("BasePart") then return { success = false, error = "Part0 not found or not a BasePart" } end
+	if not part1 or not part1:IsA("BasePart") then return { success = false, error = "Part1 not found or not a BasePart" } end
+	ChangeHistoryService:SetWaypoint("LS:create weld")
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = part0
+	weld.Part1 = part1
+	weld.Parent = part0
+	ChangeHistoryService:SetWaypoint("LS:created weld")
+	return { success = true, data = { name = weld.Name, path = getInstancePath(weld) } }
+end
+
+handlers["get_bounding_box"] = function(params)
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Not found" } end
+	if inst:IsA("Model") then
+		local cf, size = inst:GetBoundingBox()
+		return { success = true, data = {
+			center = { cf.Position.X, cf.Position.Y, cf.Position.Z },
+			size = { size.X, size.Y, size.Z },
+		}}
+	elseif inst:IsA("BasePart") then
+		return { success = true, data = {
+			center = { inst.Position.X, inst.Position.Y, inst.Position.Z },
+			size = { inst.Size.X, inst.Size.Y, inst.Size.Z },
+		}}
+	else
+		return { success = false, error = "Instance has no bounding box (not a Model or BasePart)" }
+	end
+end
+
+handlers["raycast"] = function(params)
+	if not params or not params.origin or not params.direction then return { success = false, error = "Missing required parameters: origin, direction" } end
+	local origin = Vector3.new(params.origin[1], params.origin[2], params.origin[3])
+	local direction = Vector3.new(params.direction[1], params.direction[2], params.direction[3])
+	local rayParams = RaycastParams.new()
+	if params.filterType == "exclude" then
+		rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	elseif params.filterType == "include" then
+		rayParams.FilterType = Enum.RaycastFilterType.Include
+	end
+	if params.filterPaths then
+		local filterList = {}
+		for _, path in params.filterPaths do
+			local inst = resolveInstance(path)
+			if inst then table.insert(filterList, inst) end
+		end
+		rayParams.FilterDescendantsInstances = filterList
+	end
+	local result = workspace:Raycast(origin, direction, rayParams)
+	if result then
+		return { success = true, data = {
+			hit = true,
+			instance = { name = result.Instance.Name, path = getInstancePath(result.Instance), className = result.Instance.ClassName },
+			position = { result.Position.X, result.Position.Y, result.Position.Z },
+			normal = { result.Normal.X, result.Normal.Y, result.Normal.Z },
+			distance = result.Distance,
+			material = tostring(result.Material),
+		}}
+	else
+		return { success = true, data = { hit = false } }
+	end
+end
+
+handlers["fill_terrain"] = function(params)
+	if not params or not params.center or not params.size then return { success = false, error = "Missing required parameters: center, size" } end
+	local center = Vector3.new(params.center[1], params.center[2], params.center[3])
+	local size = Vector3.new(params.size[1], params.size[2], params.size[3])
+	local materialName = params.material or "Grass"
+	local material = Enum.Material[materialName]
+	if not material then return { success = false, error = "Invalid material: " .. materialName } end
+	ChangeHistoryService:SetWaypoint("LS:fill terrain")
+	local region = Region3.new(center - size / 2, center + size / 2)
+	workspace.Terrain:FillRegion(region:ExpandToGrid(4), 4, material)
+	ChangeHistoryService:SetWaypoint("LS:filled terrain")
+	return { success = true, data = { center = params.center, size = params.size, material = materialName } }
+end
+
+handlers["clear_terrain"] = function(params)
+	if params and params.region and params.region.center and params.region.size then
+		local center = Vector3.new(params.region.center[1], params.region.center[2], params.region.center[3])
+		local size = Vector3.new(params.region.size[1], params.region.size[2], params.region.size[3])
+		local region = Region3.new(center - size / 2, center + size / 2)
+		ChangeHistoryService:SetWaypoint("LS:clear terrain region")
+		workspace.Terrain:FillRegion(region:ExpandToGrid(4), 4, Enum.Material.Air)
+		ChangeHistoryService:SetWaypoint("LS:cleared terrain region")
+	else
+		ChangeHistoryService:SetWaypoint("LS:clear all terrain")
+		workspace.Terrain:Clear()
+		ChangeHistoryService:SetWaypoint("LS:cleared all terrain")
+	end
+	return { success = true, data = { message = "Terrain cleared" } }
+end
+
+-- ============================================================================
+-- Phase 6: Advanced Tools
+-- ============================================================================
+
+handlers["redo"] = function(params)
+	local count = (params and params.count) or 1
+	for _ = 1, count do ChangeHistoryService:Redo() end
+	return { success = true, data = { message = "Redo " .. count .. " step(s)" } }
+end
+
+handlers["get_descendants"] = function(params)
+	local rootPath = (params and params.path) or "game.Workspace"
+	local root = resolveInstance(rootPath)
+	if not root then return { success = false, error = "Not found: " .. rootPath } end
+	local results = {}
+	local maxDepth = (params and params.maxDepth) or -1
+	local limit = (params and params.limit) or 500
+	local className = params and params.className
+	local namePattern = params and params.namePattern
+	local function traverse(inst, depth, path)
+		if #results >= limit then return end
+		if maxDepth >= 0 and depth > maxDepth then return end
+		local fullPath = path .. "." .. inst.Name
+		local match = true
+		if className and inst.ClassName ~= className then match = false end
+		if namePattern and not string.find(inst.Name, namePattern, 1, true) then match = false end
+		if match then table.insert(results, { name = inst.Name, path = fullPath, className = inst.ClassName }) end
+		for _, child in inst:GetChildren() do traverse(child, depth + 1, fullPath) end
+	end
+	for _, child in root:GetChildren() do traverse(child, 1, rootPath) end
+	return { success = true, data = { results = results, count = #results, truncated = #results >= limit } }
+end
+
+handlers["batch_operations"] = function(params)
+	if not params.operations then return { success = false, error = "No operations provided" } end
+	ChangeHistoryService:SetWaypoint("LS:batch start")
+	local results = {}
+	for i, op in params.operations do
+		if op.tool == "batch_operations" then
+			table.insert(results, { index = i, success = false, error = "Recursive batch_operations not allowed" })
+			continue
+		end
+		local handler = handlers[op.tool]
+		if not handler then
+			table.insert(results, { index = i, success = false, error = "Unknown tool: " .. tostring(op.tool) })
+		else
+			local ok, result = pcall(handler, op.params or {})
+			if ok then
+				table.insert(results, { index = i, success = result.success, data = result.data, error = result.error })
+			else
+				table.insert(results, { index = i, success = false, error = "Handler error: " .. tostring(result) })
+			end
+		end
+	end
+	ChangeHistoryService:SetWaypoint("LS:batch done")
+	local successCount = 0
+	for _, r in results do if r.success then successCount += 1 end end
+	return { success = true, data = { results = results, total = #results, succeeded = successCount, failed = #results - successCount } }
+end
+
+handlers["get_console_output"] = function(params)
+	local since = (params and params.since) or 0
+	local limit = (params and params.limit) or 100
+	local filtered = {}
+	for i = #consoleLogs, 1, -1 do
+		if #filtered >= limit then break end
+		if consoleLogs[i].timestamp > since then
+			table.insert(filtered, 1, consoleLogs[i])
+		end
+	end
+	return { success = true, data = { logs = filtered, total = #consoleLogs } }
+end
+
+-- Count registered handlers for status display
+local HANDLER_COUNT = 0
+for _ in handlers do HANDLER_COUNT += 1 end
+toolsRow.Text = "Tools: " .. HANDLER_COUNT .. " registered"
+
+-- ============================================================================
+-- Main Communication Loop
+-- ============================================================================
+
+local function heartbeat()
+	local t0 = os.clock()
+	local ok, result = httpPost("/heartbeat", {
+		instanceId = instanceId, pluginVersion = PLUGIN_VERSION, studioVersion = "N/A",
+		placeName = game.Name ~= "" and game.Name or "Unnamed", placeId = game.PlaceId,
+		mode = currentMode, state = pluginState,
+	})
+	lastLatencyMs = math.floor((os.clock() - t0) * 1000)
+	if ok and result then
+		lastHeartbeatData = result
+		if not connected then
+			connected = true
+			updateStatus("idle", "Connected — idle")
+			showToast("Connected to server", "success")
+		end
+		if result.mode then currentMode = result.mode end
+		return true
+	else
+		if connected then
+			connected = false
+			updateStatus("disconnected", "Connection lost")
+			showToast("Connection lost", "error")
+		end
+		return false
+	end
+end
+
+local function pollForWork()
+	local ok, request = httpGet("/poll/" .. instanceId)
+	if ok and request and request.id then
+		updateStatus("active", "Running: " .. (request.action or "unknown"))
+		addFeedEntry(request.action or "unknown", "pending")
+
+		local startTime = os.clock()
+		local handler = handlers[request.action]
+		local response
+		if handler then
+			local handlerOk, handlerResult = pcall(handler, request.params or {})
+			response = handlerOk and handlerResult or { success = false, error = "Handler error: " .. tostring(handlerResult) }
+		else
+			response = { success = false, error = "Unknown tool: " .. (request.action or "nil") }
+		end
+		local duration = (os.clock() - startTime) * 1000
+
+		httpPost("/response", { id = request.id, success = response.success, data = response.data, error = response.error })
+
+		-- Determine scriptPath for clickable feed entries
+		local scriptPath = nil
+		if SCRIPT_TOOLS[request.action] and request.params then
+			scriptPath = request.params.path or request.params.scriptPath
+		end
+		addFeedEntry(request.action or "unknown", response.success and "success" or "error", duration, scriptPath)
+
+		-- Keep cat active for at least ACTIVE_MIN_DURATION seconds
+		activeUntil = os.clock() + ACTIVE_MIN_DURATION
+		task.delay(ACTIVE_MIN_DURATION, function()
+			if os.clock() >= activeUntil and pluginState == "active" then
+				updateStatus("idle", "Connected — idle")
+			end
+		end)
+	end
+end
+
+local function mainLoop()
+	updateStatus("disconnected", "Connecting...")
+	while running do
+		local heartbeatOk = heartbeat()
+		if not heartbeatOk and not connected then
+			updateStatus("error", "Connection failed — check server")
+			for _ = 1, 50 do if not running then break end; task.wait(0.1) end
+			if not running then break end
+			updateStatus("disconnected", "Connecting...")
+			continue
+		end
+		if connected then
+			local ok, err = pcall(pollForWork)
+			if not ok then warn("[LS] Poll error:", err); updateStatus("error", "Poll error"); task.wait(2) end
+		else
+			task.wait(HEARTBEAT_INTERVAL)
+		end
+		task.wait(0.1)
+	end
+end
+
+-- ============================================================================
+-- Mascot Animations (started via registry system)
+-- ============================================================================
+
+startMascotAnimations()
+
+-- ============================================================================
+-- Toggle Button
+-- ============================================================================
+
+local function startConnection()
+	if running then return end
+	running = true
+	widget.Enabled = true
+	updateConnectButton()
+	task.spawn(mainLoop)
+end
+
+local function stopConnection()
+	if not running then return end
+	running = false
+	connected = false
+	updateStatus("disconnected", "Disconnected")
+	updateConnectButton()
+end
+
+toggleButton.Click:Connect(function()
+	if running then stopConnection(); widget.Enabled = false
+	else startConnection() end
+end)
+
+connectButton.Activated:Connect(function()
+	if running then stopConnection() else startConnection() end
+end)
+
+-- ============================================================================
+-- Plugin Cleanup
+-- ============================================================================
+
+plugin.Unloading:Connect(function()
+	running = false
+	connected = false
+	pluginState = ""
+	if currentMascotStop then currentMascotStop() end
+end)
+
+-- Initial state
+updateStatus("disconnected", "Click toolbar button to connect")
+]]></ProtectedString>
+			<bool name="Disabled">false</bool>
+			<Content name="LinkedSource"><null></null></Content>
+			<token name="RunContext">0</token>
+		</Properties>
+	</Item>
+</roblox>

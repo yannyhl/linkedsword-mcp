@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "linkedsword": {
+      "command": "node",
+      "args": [
+        "packages/server/dist/index.js"
+      ]
+    }
+  }
+}

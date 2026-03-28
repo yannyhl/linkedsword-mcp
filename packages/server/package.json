@@ -1,0 +1,36 @@
+{
+  "name": "linkedsword-mcp-server",
+  "version": "0.1.0",
+  "description": "Linkedsword MCP server — agentic Roblox Studio integration with script diffs, bulk ops, and playtest automation",
+  "main": "dist/index.js",
+  "bin": {
+    "linkedsword-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs --dts --clean",
+    "dev": "tsup src/index.ts --format cjs --watch --onSuccess 'node dist/index.js'",
+    "start": "node dist/index.js",
+    "lint": "tsc --noEmit",
+    "install-plugin": "node scripts/install-plugin.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.0",
+    "express": "^4.21.0",
+    "diff": "^7.0.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/diff": "^6.0.0",
+    "@types/uuid": "^10.0.0",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0"
+  },
+  "keywords": ["mcp", "roblox", "roblox-studio", "linkedsword"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
