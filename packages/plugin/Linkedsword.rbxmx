@@ -31,11 +31,32 @@ local LogService = game:GetService("LogService")
 local PathfindingService = game:GetService("PathfindingService")
 
 -- Constants
-local PLUGIN_VERSION = "0.4.0"
+local PLUGIN_VERSION = "0.6.0"
 local DEFAULT_PORT = 3003
 local HEARTBEAT_INTERVAL = 5
 local POLL_TIMEOUT = 30
 local MAX_RETRY_ATTEMPTS = 3
+
+-- Inspector-build flag. Default `false`; the `--inspector` build target in
+-- packages/plugin/build-rbxmx.js rewrites this to `true` at build time so
+-- write tools are physically disabled in the distributed inspector plugin.
+local INSPECTOR_ONLY = false
+
+-- Tools allowed when INSPECTOR_ONLY is true. Must match the read-only allowlist
+-- maintained server-side in services/bridge.ts (isReadOnlyTool).
+local READ_ONLY_TOOLS = {
+	get_file_tree = true, search_files = true, get_place_info = true, get_services = true,
+	search_objects = true, get_instance_properties = true, get_instance_children = true,
+	search_by_property = true, get_class_info = true, get_project_structure = true,
+	mass_get_property = true, get_script_source = true, grep_scripts = true,
+	get_attribute = true, get_attributes = true, get_tags = true, get_tagged = true,
+	get_selection = true, get_playtest_output = true, get_studio_mode = true,
+	list_roblox_studios = true, get_diff_queue = true, get_activity_log = true,
+	get_diff_history = true, capture_screenshot = true, get_bounding_box = true,
+	get_descendants = true, get_console_output = true, raycast = true,
+	resolve_stable_id = true, compare_instances = true, get_connected_instances = true,
+	get_auto_accept_status = true,
+}
 
 -- Default theme (shadcn/zinc-inspired palette)
 local DEFAULT_THEME = {
@@ -138,6 +159,16 @@ local toggleButton = toolbar:CreateButton(
 	"Linkedsword"
 )
 
+-- Copy a stable handle for each selected instance to the clipboard. Lets users
+-- paste durable references into external prompts that survive renames/reparents.
+local copyHandleButton = toolbar:CreateButton(
+	"Copy LS Handle",
+	"Copy stable Linkedsword handle(s) for the current selection",
+	"rbxassetid://0",
+	"Copy LS Handle"
+)
+copyHandleButton.ClickableWhenViewportHidden = true
+
 -- Script-related tools (for clickable feed entries)
 local SCRIPT_TOOLS = {
 	set_script_source = true,
@@ -152,8 +183,31 @@ local SCRIPT_TOOLS = {
 -- Utility Functions (declared before handlers so no forward-reference issues)
 -- ============================================================================
 
+-- Stable-ID index: ls://<uuid> → Instance (in-memory cache)
+-- Persisted alongside the instance as an `LSStableId` attribute so it survives
+-- save/reopen; the index is rebuilt lazily as resolve_stable_id queries arrive.
+local stableIdIndex: { [string]: Instance } = {}
+
+local function findInstanceByStableId(id: string): Instance?
+	local cached = stableIdIndex[id]
+	if cached and cached.Parent then return cached end
+	-- Cache miss or stale: scan descendants until we find the matching attribute.
+	-- Bounded by the size of the DataModel; this is the slow path.
+	for _, inst in game:GetDescendants() do
+		if inst:GetAttribute("LSStableId") == id then
+			stableIdIndex[id] = inst
+			return inst
+		end
+	end
+	stableIdIndex[id] = nil
+	return nil
+end
+
 local function resolveInstance(path: string?): Instance?
 	if not path then return nil end
+	if string.sub(path, 1, 5) == "ls://" then
+		return findInstanceByStableId(string.sub(path, 6))
+	end
 	local current: Instance = game
 	for _, segment in string.split(path, ".") do
 		if segment == "game" then continue end
@@ -1706,6 +1760,113 @@ local function reconstructNewSource(diffData)
 	return table.concat(result, "\n")
 end
 
+local function buildFullScriptLines(oldSource, hunks)
+	local oldLines = string.split(oldSource, "\n")
+	local result = {}
+	local oldIdx = 1
+	local newLineNum = 1
+
+	for hunkIdx, hunk in hunks do
+		while oldIdx < hunk.startOld do
+			table.insert(result, {
+				type = "plain",
+				lineOld = oldIdx,
+				lineNew = newLineNum,
+				content = oldLines[oldIdx] or "",
+				hunkIdx = nil,
+			})
+			oldIdx += 1
+			newLineNum += 1
+		end
+
+		table.insert(result, { isHunkBoundary = true, hunkIdx = hunkIdx })
+
+		for _, line in hunk.lines do
+			table.insert(result, {
+				type = line.type,
+				lineOld = line.lineOld,
+				lineNew = line.lineNew,
+				content = line.content,
+				hunkIdx = hunkIdx,
+			})
+			if line.type == "del" or line.type == "ctx" then
+				oldIdx += 1
+			end
+			if line.type == "add" or line.type == "ctx" then
+				newLineNum = (line.lineNew or newLineNum) + 1
+			end
+		end
+	end
+
+	while oldIdx <= #oldLines do
+		table.insert(result, {
+			type = "plain",
+			lineOld = oldIdx,
+			lineNew = newLineNum,
+			content = oldLines[oldIdx] or "",
+			hunkIdx = nil,
+		})
+		oldIdx += 1
+		newLineNum += 1
+	end
+
+	return result
+end
+
+local function collapseFullScriptLines(displayLines, expandedRegions)
+	local result = {}
+	local plainRun = {}
+	local plainStartIdx = nil
+
+	local function flushPlainRun()
+		if #plainRun <= 20 then
+			for _, line in plainRun do
+				table.insert(result, line)
+			end
+		else
+			local regionKey = plainStartIdx
+			if expandedRegions[regionKey] then
+				for _, line in plainRun do
+					table.insert(result, line)
+				end
+			else
+				for i = 1, 5 do
+					table.insert(result, plainRun[i])
+				end
+				table.insert(result, {
+					isCollapsed = true,
+					hiddenCount = #plainRun - 10,
+					regionKey = regionKey,
+				})
+				for i = #plainRun - 4, #plainRun do
+					table.insert(result, plainRun[i])
+				end
+			end
+		end
+		plainRun = {}
+		plainStartIdx = nil
+	end
+
+	for i, entry in displayLines do
+		if entry.type == "plain" then
+			if plainStartIdx == nil then
+				plainStartIdx = i
+			end
+			table.insert(plainRun, entry)
+		else
+			if #plainRun > 0 then
+				flushPlainRun()
+			end
+			table.insert(result, entry)
+		end
+	end
+	if #plainRun > 0 then
+		flushPlainRun()
+	end
+
+	return result
+end
+
 local function archiveDiff(diffId, diffData)
 	local addCount, delCount = 0, 0
 	local acceptedCount, rejectedCount = 0, 0
@@ -1722,17 +1883,29 @@ local function archiveDiff(diffId, diffData)
 		elseif acceptedCount == 0 then "rejected"
 		else "partial"
 
+	-- Truncate oldSource for storage (cap at 100k chars)
+	local storedOldSource = diffData.oldSource
+	if storedOldSource and #storedOldSource > 100000 then
+		storedOldSource = string.sub(storedOldSource, 1, 100000)
+	end
+
 	table.insert(diffHistory, {
 		id = diffId,
 		scriptPath = diffData.scriptPath or diffData.scriptName or "Unknown",
 		scriptName = diffData.scriptName or "Script",
 		hunks = diffData.hunks,
+		oldSource = storedOldSource,
 		timestamp = diffData.timestamp or os.time(),
 		resolvedAt = os.time(),
 		outcome = outcome,
 		addCount = addCount,
 		delCount = delCount,
 	})
+
+	-- Cap history at 20 entries
+	while #diffHistory > 20 do
+		table.remove(diffHistory, 1)
+	end
 
 	saveDiffHistory()
 end
@@ -1786,6 +1959,7 @@ diffRoot.Parent = diffWidget
 -- Tab bar for switching between Pending and History views
 local diffViewMode = "pending" -- "pending" | "history"
 local selectedHistoryIdx = nil -- which history entry is being viewed (nil = list)
+local expandedRegions = {} -- tracks which collapsed plain-line regions are expanded
 
 local tabBar = Instance.new("Frame")
 tabBar.Name = "TabBar"
@@ -2244,7 +2418,7 @@ diffBtnFrame.Name = "DiffBtnFrame"
 diffBtnFrame.Size = UDim2.new(1, 0, 0, 28)
 diffBtnFrame.BackgroundTransparency = 1
 diffBtnFrame.LayoutOrder = 4
-diffBtnFrame.Visible = false
+diffBtnFrame.Visible = true
 diffBtnFrame.Parent = root
 
 local diffOpenBtn = Instance.new("TextButton")
@@ -2878,13 +3052,13 @@ local function updateDiffBadge()
 	local count = 0
 	for _ in diffQueue do count += 1 end
 	diffOpenBtn.Text = "View Diffs (" .. count .. ")"
-	diffBtnFrame.Visible = count > 0
+	diffBtnFrame.Visible = true
 	diffEmptyLabel.Visible = (count == 0 and diffViewMode == "pending")
 	historyTab.Text = "History (" .. #diffHistory .. ")"
 end
 
 -- Creates a single diff line row (line number gutters + code content)
-local function createDiffLineRow(lineData, layoutOrder)
+local function createDiffLineRow(lineData, layoutOrder, inHunk)
 	local row = Instance.new("Frame")
 	row.Name = "Line_" .. layoutOrder
 	row.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
@@ -2893,9 +3067,29 @@ local function createDiffLineRow(lineData, layoutOrder)
 
 	local isAdd = lineData.type == "add"
 	local isDel = lineData.type == "del"
+	local isPlain = lineData.type == "plain"
 
 	-- Full row background
-	row.BackgroundColor3 = isAdd and ADD_BG or isDel and DEL_BG or DIFF_BG
+	if isAdd then
+		row.BackgroundColor3 = ADD_BG
+	elseif isDel then
+		row.BackgroundColor3 = DEL_BG
+	elseif inHunk then
+		row.BackgroundColor3 = Color3.fromRGB(17, 21, 28)
+	else
+		row.BackgroundColor3 = DIFF_BG
+	end
+
+	-- Blue accent bar for hunk lines
+	if inHunk then
+		local accent = Instance.new("Frame")
+		accent.Size = UDim2.new(0, 3, 1, 0)
+		accent.Position = UDim2.new(0, 0, 0, 0)
+		accent.BackgroundColor3 = Color3.fromRGB(59, 130, 246)
+		accent.BorderSizePixel = 0
+		accent.ZIndex = 2
+		accent.Parent = row
+	end
 
 	-- Old line number gutter
 	local oldGutter = Instance.new("TextLabel")
@@ -2904,7 +3098,7 @@ local function createDiffLineRow(lineData, layoutOrder)
 	oldGutter.BackgroundColor3 = isAdd and ADD_BG_STRONG or isDel and DEL_BG_STRONG or DIFF_HEADER_BG
 	oldGutter.BackgroundTransparency = 0.5
 	oldGutter.BorderSizePixel = 0
-	oldGutter.Text = if isDel or (not isAdd and lineData.lineOld) then tostring(lineData.lineOld or "") else ""
+	oldGutter.Text = if isDel or isPlain or (not isAdd and lineData.lineOld) then tostring(lineData.lineOld or "") else ""
 	oldGutter.TextColor3 = GUTTER_TEXT
 	oldGutter.TextSize = 12
 	oldGutter.Font = Enum.Font.Code
@@ -2917,7 +3111,7 @@ local function createDiffLineRow(lineData, layoutOrder)
 	newGutter.BackgroundColor3 = isAdd and ADD_BG_STRONG or isDel and DEL_BG_STRONG or DIFF_HEADER_BG
 	newGutter.BackgroundTransparency = 0.5
 	newGutter.BorderSizePixel = 0
-	newGutter.Text = if isAdd or (not isDel and lineData.lineNew) then tostring(lineData.lineNew or "") else ""
+	newGutter.Text = if isAdd or isPlain or (not isDel and lineData.lineNew) then tostring(lineData.lineNew or "") else ""
 	newGutter.TextColor3 = GUTTER_TEXT
 	newGutter.TextSize = 12
 	newGutter.Font = Enum.Font.Code
@@ -3036,49 +3230,111 @@ local function renderHistoryDetail(entry)
 	outcomeBadge.Parent = fileHeader
 	Instance.new("UICorner", outcomeBadge).CornerRadius = UDim.new(0, 4)
 
-	-- Render each hunk
+	-- Build display lines: full script if oldSource available, else hunks only
+	local firstChangePixelOffset = nil
+	local pixelOffset = 32 + 36 -- back bar + file header
+
 	if entry.hunks then
-		for hunkIdx, hunk in entry.hunks do
-			lineOrder += 1
-
-			-- Hunk separator
-			local hunkSep = Instance.new("Frame")
-			hunkSep.Name = "HistHunkSep_" .. hunkIdx
-			hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
-			hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
-			hunkSep.BorderSizePixel = 0
-			hunkSep.LayoutOrder = lineOrder
-			hunkSep.Parent = diffScroll
-
-			local hunkLabel = Instance.new("TextLabel")
-			hunkLabel.Size = UDim2.new(1, -80, 1, 0)
-			hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
-			hunkLabel.BackgroundTransparency = 1
-			hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld or 0, (hunk.startOld or 0) + #hunk.lines)
-			hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
-			hunkLabel.TextSize = 12
-			hunkLabel.Font = Enum.Font.Code
-			hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
-			hunkLabel.Parent = hunkSep
-
-			-- Read-only status badge
-			local badge = Instance.new("TextLabel")
-			badge.Size = UDim2.new(0, 60, 0, 18)
-			badge.Position = UDim2.new(1, -66, 0.5, -9)
-			badge.BackgroundTransparency = 1
-			badge.Text = if hunk.status == "accepted" then "✓ Accepted" else "✗ Rejected"
-			badge.TextColor3 = if hunk.status == "accepted" then ADD_TEXT else DEL_TEXT
-			badge.TextSize = 10
-			badge.Font = Enum.Font.GothamBold
-			badge.Parent = hunkSep
-
-			-- Render diff lines (reuses createDiffLineRow)
-			for _, line in hunk.lines do
-				lineOrder += 1
-				local lineRow = createDiffLineRow(line, lineOrder)
-				lineRow.Parent = diffScroll
+		local displayLines
+		if entry.oldSource then
+			local fullLines = buildFullScriptLines(entry.oldSource, entry.hunks)
+			displayLines = collapseFullScriptLines(fullLines, expandedRegions)
+		else
+			displayLines = {}
+			for hunkIdx, hunk in entry.hunks do
+				table.insert(displayLines, { isHunkBoundary = true, hunkIdx = hunkIdx })
+				for _, line in hunk.lines do
+					table.insert(displayLines, {
+						type = line.type,
+						lineOld = line.lineOld,
+						lineNew = line.lineNew,
+						content = line.content,
+						hunkIdx = hunkIdx,
+					})
+				end
 			end
 		end
+
+		for _, displayEntry in displayLines do
+			if displayEntry.isHunkBoundary then
+				local hunkIdx = displayEntry.hunkIdx
+				local hunk = entry.hunks[hunkIdx]
+				lineOrder += 1
+
+				-- Hunk separator
+				local hunkSep = Instance.new("Frame")
+				hunkSep.Name = "HistHunkSep_" .. hunkIdx
+				hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+				hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
+				hunkSep.BorderSizePixel = 0
+				hunkSep.LayoutOrder = lineOrder
+				hunkSep.Parent = diffScroll
+
+				local hunkLabel = Instance.new("TextLabel")
+				hunkLabel.Size = UDim2.new(1, -80, 1, 0)
+				hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
+				hunkLabel.BackgroundTransparency = 1
+				hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld or 0, (hunk.startOld or 0) + #hunk.lines)
+				hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
+				hunkLabel.TextSize = 12
+				hunkLabel.Font = Enum.Font.Code
+				hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
+				hunkLabel.Parent = hunkSep
+
+				-- Read-only status badge
+				local badge = Instance.new("TextLabel")
+				badge.Size = UDim2.new(0, 60, 0, 18)
+				badge.Position = UDim2.new(1, -66, 0.5, -9)
+				badge.BackgroundTransparency = 1
+				badge.Text = if hunk.status == "accepted" then "✓ Accepted" else "✗ Rejected"
+				badge.TextColor3 = if hunk.status == "accepted" then ADD_TEXT else DEL_TEXT
+				badge.TextSize = 10
+				badge.Font = Enum.Font.GothamBold
+				badge.Parent = hunkSep
+
+				pixelOffset += LINE_HEIGHT
+
+			elseif displayEntry.isCollapsed then
+				lineOrder += 1
+				local collapseBar = Instance.new("TextButton")
+				collapseBar.Name = "HistCollapse_" .. lineOrder
+				collapseBar.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+				collapseBar.BackgroundColor3 = DIFF_HEADER_BG
+				collapseBar.BorderSizePixel = 0
+				collapseBar.LayoutOrder = lineOrder
+				collapseBar.Text = string.format("  ⋯ %d lines hidden ⋯", displayEntry.hiddenCount)
+				collapseBar.TextColor3 = GUTTER_TEXT
+				collapseBar.TextSize = 11
+				collapseBar.Font = Enum.Font.Code
+				collapseBar.TextXAlignment = Enum.TextXAlignment.Center
+				collapseBar.Parent = diffScroll
+
+				local capturedKey = displayEntry.regionKey
+				collapseBar.Activated:Connect(function()
+					expandedRegions[capturedKey] = true
+					renderHistoryDetail(entry)
+				end)
+
+				pixelOffset += LINE_HEIGHT
+
+			else
+				lineOrder += 1
+				if not firstChangePixelOffset and (displayEntry.type == "add" or displayEntry.type == "del") then
+					firstChangePixelOffset = pixelOffset
+				end
+				local lineRow = createDiffLineRow(displayEntry, lineOrder, displayEntry.hunkIdx ~= nil)
+				lineRow.Parent = diffScroll
+				pixelOffset += LINE_HEIGHT
+			end
+		end
+	end
+
+	-- Auto-scroll to first change in history detail
+	if firstChangePixelOffset then
+		task.defer(function()
+			local scrollY = math.max(0, firstChangePixelOffset - diffScroll.AbsoluteSize.Y / 3)
+			diffScroll.CanvasPosition = Vector2.new(0, scrollY)
+		end)
 	end
 
 	-- Bottom border
@@ -3298,6 +3554,8 @@ renderDiffUI = function()
 	-- Clear everything except layout and empty label
 	clearDiffScroll()
 
+	local globalFirstChangeOffset = nil
+	local globalPixelOffset = 0
 	local sectionOrder = 0
 	for diffId, diffData in diffQueue do
 		sectionOrder += 1
@@ -3370,126 +3628,186 @@ renderDiffUI = function()
 		rejectBtn.Parent = fileHeader
 		Instance.new("UICorner", rejectBtn).CornerRadius = UDim.new(0, 6)
 
-		-- ═══ Render each hunk ═══
+		-- ═══ Render full script with hunks ═══
 		local lineOrder = sectionOrder * 1000
-		for hunkIdx, hunk in diffData.hunks do
-			lineOrder += 1
+		local firstChangePixelOffset = nil
+		local pixelOffset = 36 -- file header height
 
-			-- Hunk separator bar (@@-style)
-			local hunkSep = Instance.new("Frame")
-			hunkSep.Name = "HunkSep_" .. hunkIdx
-			hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
-			hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
-			hunkSep.BorderSizePixel = 0
-			hunkSep.LayoutOrder = lineOrder
-			hunkSep.Parent = diffScroll
-
-			local hunkLabel = Instance.new("TextLabel")
-			hunkLabel.Size = UDim2.new(1, -12, 1, 0)
-			hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
-			hunkLabel.BackgroundTransparency = 1
-			hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld, hunk.startOld + #hunk.lines)
-			hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
-			hunkLabel.TextSize = 12
-			hunkLabel.Font = Enum.Font.Code
-			hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
-			hunkLabel.Parent = hunkSep
-
-			-- Per-hunk accept/reject (small, right-aligned in separator)
-			if hunk.status == "pending" then
-				local hAccBtn = Instance.new("TextButton")
-				hAccBtn.Size = UDim2.new(0, 20, 0, 18)
-				hAccBtn.Position = UDim2.new(1, -48, 0.5, -9)
-				hAccBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
-				hAccBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-				hAccBtn.Text = "✓"
-				hAccBtn.TextSize = 11
-				hAccBtn.Font = Enum.Font.GothamBold
-				hAccBtn.BorderSizePixel = 0
-				hAccBtn.Parent = hunkSep
-				Instance.new("UICorner", hAccBtn).CornerRadius = UDim.new(0, 4)
-
-				local hRejBtn = Instance.new("TextButton")
-				hRejBtn.Size = UDim2.new(0, 20, 0, 18)
-				hRejBtn.Position = UDim2.new(1, -24, 0.5, -9)
-				hRejBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
-				hRejBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-				hRejBtn.Text = "✗"
-				hRejBtn.TextSize = 11
-				hRejBtn.Font = Enum.Font.GothamBold
-				hRejBtn.BorderSizePixel = 0
-				hRejBtn.Parent = hunkSep
-				Instance.new("UICorner", hRejBtn).CornerRadius = UDim.new(0, 4)
-
-				local capturedDiffId = diffId
-				local capturedHunkId = hunk.id
-
-				local function checkAllResolved()
-					local allResolved = true
-					for _, h in diffData.hunks do
-						if h.status == "pending" then allResolved = false; break end
-					end
-					if allResolved then
-						local hasAccepted = false
-						for _, h in diffData.hunks do
-							if h.status == "accepted" then hasAccepted = true; break end
-						end
-						if hasAccepted then
-							local finalSource = applyPartialDiff(diffData)
-							if finalSource then
-								local inst = resolveInstance(diffData.scriptPath)
-								if inst and inst:IsA("LuaSourceContainer") then
-									ChangeHistoryService:SetWaypoint("LS:apply diff")
-									ScriptEditorService:UpdateSourceAsync(inst, function() return finalSource end)
-									ChangeHistoryService:SetWaypoint("LS:applied diff")
-								end
-							end
-						end
-						archiveDiff(capturedDiffId, diffData)
-						diffQueue[capturedDiffId] = nil
-					end
-					task.defer(renderDiffUI)
+		-- Build display lines: full script if oldSource available, else hunks only
+		local displayLines
+		if diffData.oldSource then
+			local fullLines = buildFullScriptLines(diffData.oldSource, diffData.hunks)
+			displayLines = collapseFullScriptLines(fullLines, expandedRegions)
+		else
+			displayLines = {}
+			for hunkIdx, hunk in diffData.hunks do
+				table.insert(displayLines, { isHunkBoundary = true, hunkIdx = hunkIdx })
+				for _, line in hunk.lines do
+					table.insert(displayLines, {
+						type = line.type,
+						lineOld = line.lineOld,
+						lineNew = line.lineNew,
+						content = line.content,
+						hunkIdx = hunkIdx,
+					})
 				end
-
-				hAccBtn.Activated:Connect(function()
-					httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "accept" })
-					hunk.status = "accepted"
-					checkAllResolved()
-				end)
-				hRejBtn.Activated:Connect(function()
-					httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "reject" })
-					hunk.status = "rejected"
-					checkAllResolved()
-				end)
-			elseif hunk.status == "accepted" then
-				local badge = Instance.new("TextLabel")
-				badge.Size = UDim2.new(0, 60, 0, 18)
-				badge.Position = UDim2.new(1, -66, 0.5, -9)
-				badge.BackgroundTransparency = 1
-				badge.Text = "✓ Accepted"
-				badge.TextColor3 = ADD_TEXT
-				badge.TextSize = 10
-				badge.Font = Enum.Font.GothamBold
-				badge.Parent = hunkSep
-			elseif hunk.status == "rejected" then
-				local badge = Instance.new("TextLabel")
-				badge.Size = UDim2.new(0, 60, 0, 18)
-				badge.Position = UDim2.new(1, -66, 0.5, -9)
-				badge.BackgroundTransparency = 1
-				badge.Text = "✗ Rejected"
-				badge.TextColor3 = DEL_TEXT
-				badge.TextSize = 10
-				badge.Font = Enum.Font.GothamBold
-				badge.Parent = hunkSep
-			end
-
-			-- Render lines
-			for _, line in hunk.lines do
-				lineOrder += 1
-				local lineRow = createDiffLineRow(line, lineOrder)
-				lineRow.Parent = diffScroll
 			end
 		end
+
+		for _, entry in displayLines do
+			if entry.isHunkBoundary then
+				local hunkIdx = entry.hunkIdx
+				local hunk = diffData.hunks[hunkIdx]
+				lineOrder += 1
+
+				-- Hunk separator bar (@@-style)
+				local hunkSep = Instance.new("Frame")
+				hunkSep.Name = "HunkSep_" .. hunkIdx
+				hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+				hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
+				hunkSep.BorderSizePixel = 0
+				hunkSep.LayoutOrder = lineOrder
+				hunkSep.Parent = diffScroll
+
+				local hunkLabel = Instance.new("TextLabel")
+				hunkLabel.Size = UDim2.new(1, -12, 1, 0)
+				hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
+				hunkLabel.BackgroundTransparency = 1
+				hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld, hunk.startOld + #hunk.lines)
+				hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
+				hunkLabel.TextSize = 12
+				hunkLabel.Font = Enum.Font.Code
+				hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
+				hunkLabel.Parent = hunkSep
+
+				-- Per-hunk accept/reject (small, right-aligned in separator)
+				if hunk.status == "pending" then
+					local hAccBtn = Instance.new("TextButton")
+					hAccBtn.Size = UDim2.new(0, 20, 0, 18)
+					hAccBtn.Position = UDim2.new(1, -48, 0.5, -9)
+					hAccBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
+					hAccBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+					hAccBtn.Text = "✓"
+					hAccBtn.TextSize = 11
+					hAccBtn.Font = Enum.Font.GothamBold
+					hAccBtn.BorderSizePixel = 0
+					hAccBtn.Parent = hunkSep
+					Instance.new("UICorner", hAccBtn).CornerRadius = UDim.new(0, 4)
+
+					local hRejBtn = Instance.new("TextButton")
+					hRejBtn.Size = UDim2.new(0, 20, 0, 18)
+					hRejBtn.Position = UDim2.new(1, -24, 0.5, -9)
+					hRejBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
+					hRejBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+					hRejBtn.Text = "✗"
+					hRejBtn.TextSize = 11
+					hRejBtn.Font = Enum.Font.GothamBold
+					hRejBtn.BorderSizePixel = 0
+					hRejBtn.Parent = hunkSep
+					Instance.new("UICorner", hRejBtn).CornerRadius = UDim.new(0, 4)
+
+					local capturedDiffId = diffId
+					local capturedHunkId = hunk.id
+
+					local function checkAllResolved()
+						local allResolved = true
+						for _, h in diffData.hunks do
+							if h.status == "pending" then allResolved = false; break end
+						end
+						if allResolved then
+							local hasAccepted = false
+							for _, h in diffData.hunks do
+								if h.status == "accepted" then hasAccepted = true; break end
+							end
+							if hasAccepted then
+								local finalSource = applyPartialDiff(diffData)
+								if finalSource then
+									local inst = resolveInstance(diffData.scriptPath)
+									if inst and inst:IsA("LuaSourceContainer") then
+										ChangeHistoryService:SetWaypoint("LS:apply diff")
+										ScriptEditorService:UpdateSourceAsync(inst, function() return finalSource end)
+										ChangeHistoryService:SetWaypoint("LS:applied diff")
+									end
+								end
+							end
+							archiveDiff(capturedDiffId, diffData)
+							diffQueue[capturedDiffId] = nil
+						end
+						task.defer(renderDiffUI)
+					end
+
+					hAccBtn.Activated:Connect(function()
+						httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "accept" })
+						hunk.status = "accepted"
+						checkAllResolved()
+					end)
+					hRejBtn.Activated:Connect(function()
+						httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "reject" })
+						hunk.status = "rejected"
+						checkAllResolved()
+					end)
+				elseif hunk.status == "accepted" then
+					local badge = Instance.new("TextLabel")
+					badge.Size = UDim2.new(0, 60, 0, 18)
+					badge.Position = UDim2.new(1, -66, 0.5, -9)
+					badge.BackgroundTransparency = 1
+					badge.Text = "✓ Accepted"
+					badge.TextColor3 = ADD_TEXT
+					badge.TextSize = 10
+					badge.Font = Enum.Font.GothamBold
+					badge.Parent = hunkSep
+				elseif hunk.status == "rejected" then
+					local badge = Instance.new("TextLabel")
+					badge.Size = UDim2.new(0, 60, 0, 18)
+					badge.Position = UDim2.new(1, -66, 0.5, -9)
+					badge.BackgroundTransparency = 1
+					badge.Text = "✗ Rejected"
+					badge.TextColor3 = DEL_TEXT
+					badge.TextSize = 10
+					badge.Font = Enum.Font.GothamBold
+					badge.Parent = hunkSep
+				end
+
+				pixelOffset += LINE_HEIGHT
+
+			elseif entry.isCollapsed then
+				lineOrder += 1
+				local collapseBar = Instance.new("TextButton")
+				collapseBar.Name = "Collapse_" .. lineOrder
+				collapseBar.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+				collapseBar.BackgroundColor3 = DIFF_HEADER_BG
+				collapseBar.BorderSizePixel = 0
+				collapseBar.LayoutOrder = lineOrder
+				collapseBar.Text = string.format("  ⋯ %d lines hidden ⋯", entry.hiddenCount)
+				collapseBar.TextColor3 = GUTTER_TEXT
+				collapseBar.TextSize = 11
+				collapseBar.Font = Enum.Font.Code
+				collapseBar.TextXAlignment = Enum.TextXAlignment.Center
+				collapseBar.Parent = diffScroll
+
+				local capturedKey = entry.regionKey
+				collapseBar.Activated:Connect(function()
+					expandedRegions[capturedKey] = true
+					task.defer(renderDiffUI)
+				end)
+
+				pixelOffset += LINE_HEIGHT
+
+			else
+				lineOrder += 1
+				if not firstChangePixelOffset and (entry.type == "add" or entry.type == "del") then
+					firstChangePixelOffset = pixelOffset
+				end
+				local lineRow = createDiffLineRow(entry, lineOrder, entry.hunkIdx ~= nil)
+				lineRow.Parent = diffScroll
+				pixelOffset += LINE_HEIGHT
+			end
+		end
+
+		if not globalFirstChangeOffset and firstChangePixelOffset then
+			globalFirstChangeOffset = globalPixelOffset + firstChangePixelOffset
+		end
+		globalPixelOffset += pixelOffset
 
 		-- ═══ Bottom border ═══
 		lineOrder += 1
@@ -3539,6 +3857,14 @@ renderDiffUI = function()
 	end
 
 	updateDiffBadge()
+
+	-- Auto-scroll to first change
+	if globalFirstChangeOffset then
+		task.defer(function()
+			local scrollY = math.max(0, globalFirstChangeOffset - diffScroll.AbsoluteSize.Y / 3)
+			diffScroll.CanvasPosition = Vector2.new(0, scrollY)
+		end)
+	end
 end
 
 -- ============================================================================
@@ -3967,23 +4293,21 @@ handlers["start_playtest"] = function(params)
 			timestamp = os.clock() - playtestStartTime,
 		})
 	end)
-	local ok, err = pcall(function()
-		if mode == "run" then
-			RunService:Run()
-		else
-			-- "play" and "server" both use plugin play
-			local toolbar = plugin:GetToolbar("LSPlaytest")
-			if toolbar then
-				-- Fallback: use RunService for "run" mode
-				RunService:Run()
-			else
-				RunService:Run()
-			end
-		end
-	end)
-	if not ok then
-		-- Fallback: try via executeLuau which has broader access
-		executeLuau("game:GetService('RunService'):Run()")
+	local VIM = game:GetService("VirtualInputManager")
+	if mode == "run" then
+		VIM:SendKeyEvent(true, Enum.KeyCode.F8, false, game)
+		task.wait(0.05)
+		VIM:SendKeyEvent(false, Enum.KeyCode.F8, false, game)
+	else
+		VIM:SendKeyEvent(true, Enum.KeyCode.F5, false, game)
+		task.wait(0.05)
+		VIM:SendKeyEvent(false, Enum.KeyCode.F5, false, game)
+	end
+	local elapsed = 0
+	while not RunService:IsRunning() and elapsed < 5 do task.wait(0.1); elapsed += 0.1 end
+	if not RunService:IsRunning() then
+		if logConnection then logConnection:Disconnect(); logConnection = nil end
+		return { success = false, error = "Failed to start playtest — Studio did not enter " .. mode .. " mode after 5 seconds." }
 	end
 	pluginState = "playtesting"
 	return { success = true, data = { message = "Playtest started in " .. mode .. " mode" } }
@@ -3994,10 +4318,12 @@ handlers["stop_playtest"] = function()
 		return { success = false, error = "No playtest is running." }
 	end
 	local duration = os.clock() - playtestStartTime
-	pcall(function() RunService:Stop() end)
-	if not RunService:IsRunning() then
-		executeLuau("game:GetService('RunService'):Stop()")
-	end
+	local VIM = game:GetService("VirtualInputManager")
+	VIM:SendKeyEvent(true, Enum.KeyCode.F5, true, game)
+	task.wait(0.05)
+	VIM:SendKeyEvent(false, Enum.KeyCode.F5, true, game)
+	local elapsed = 0
+	while RunService:IsRunning() and elapsed < 5 do task.wait(0.1); elapsed += 0.1 end
 	if logConnection then logConnection:Disconnect(); logConnection = nil end
 	local errors = {}
 	for _, log in playtestLogs do
@@ -4019,14 +4345,16 @@ handlers["get_playtest_output"] = function(params)
 end
 
 handlers["run_script_in_play_mode"] = function(params)
-	if not RunService:IsRunning() then
-		local startResult = handlers["start_playtest"]({ mode = "run" })
+	if not params or not params.code then return { success = false, error = "Missing required parameter: code" } end
+	local wasRunning = RunService:IsRunning()
+	if not wasRunning then
+		local startResult = handlers["start_playtest"]({ mode = params.mode or "run" })
 		if not startResult.success then return startResult end
-		local elapsed = 0
-		while not RunService:IsRunning() and elapsed < 5 do task.wait(0.1); elapsed += 0.1 end
+		task.wait(1)
 	end
 	local result = executeLuau(params.code)
-	task.wait(0.5)
+	local timeout = params.timeout or 30
+	task.wait(math.min(timeout, 1))
 	local stopResult = handlers["stop_playtest"]()
 	return {
 		success = result.success,
@@ -4580,20 +4908,502 @@ end
 handlers["get_console_output"] = function(params)
 	local since = (params and params.since) or 0
 	local limit = (params and params.limit) or 100
+	local typeFilter = params and params.type or "all"
 	local filtered = {}
 	for i = #consoleLogs, 1, -1 do
 		if #filtered >= limit then break end
-		if consoleLogs[i].timestamp > since then
-			table.insert(filtered, 1, consoleLogs[i])
+		local entry = consoleLogs[i]
+		if entry.timestamp > since and (typeFilter == "all" or entry.type == typeFilter) then
+			table.insert(filtered, 1, entry)
 		end
 	end
 	return { success = true, data = { logs = filtered, total = #consoleLogs } }
+end
+
+-- ============================================================================
+-- Stable Instance Handles (P1.1) — survive renames/reparents
+-- ============================================================================
+
+handlers["get_stable_id"] = function(params)
+	if not params or not params.path then
+		return { success = false, error = "Missing required parameter: path" }
+	end
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. tostring(params.path) } end
+	local existing = inst:GetAttribute("LSStableId")
+	if type(existing) == "string" and existing ~= "" then
+		stableIdIndex[existing] = inst
+		return { success = true, data = { id = existing, path = getInstancePath(inst), reused = true } }
+	end
+	local id = HttpService:GenerateGUID(false)
+	ChangeHistoryService:SetWaypoint("LS:tag stable id")
+	inst:SetAttribute("LSStableId", id)
+	ChangeHistoryService:SetWaypoint("LS:tagged stable id")
+	stableIdIndex[id] = inst
+	return { success = true, data = { id = id, path = getInstancePath(inst), reused = false } }
+end
+
+handlers["resolve_stable_id"] = function(params)
+	if not params or not params.id then
+		return { success = false, error = "Missing required parameter: id" }
+	end
+	local inst = findInstanceByStableId(params.id)
+	if not inst then return { success = true, data = { exists = false } } end
+	return { success = true, data = { exists = true, path = getInstancePath(inst), className = inst.ClassName, name = inst.Name } }
+end
+
+-- ============================================================================
+-- compare_instances (P1.2)
+-- ============================================================================
+
+-- Serialize a property value into a comparable form. Returns nil for values we
+-- can't safely diff (functions, threads, userdata that doesn't survive tostring).
+local function serializeProperty(value: any): any
+	local t = typeof(value)
+	if t == "string" or t == "number" or t == "boolean" then return value end
+	if t == "nil" then return nil end
+	if t == "Color3" then return { r = value.R, g = value.G, b = value.B } end
+	if t == "Vector3" then return { x = value.X, y = value.Y, z = value.Z } end
+	if t == "Vector2" then return { x = value.X, y = value.Y } end
+	if t == "UDim2" then return { sx = value.X.Scale, ox = value.X.Offset, sy = value.Y.Scale, oy = value.Y.Offset } end
+	if t == "CFrame" then return { tostring(value) } end
+	if t == "EnumItem" then return tostring(value) end
+	if t == "Instance" then return getInstancePath(value) end
+	return tostring(value)
+end
+
+local COMPARE_PROP_LIST = {
+	"Name", "ClassName", "Parent", "Anchored", "CanCollide", "Transparency", "Material",
+	"Size", "Position", "Orientation", "Color", "BrickColor", "Reflectance", "CastShadow",
+	"Visible", "Text", "TextColor3", "BackgroundColor3", "BackgroundTransparency",
+	"Value", "SourceAssetId", "Disabled", "RunContext",
+}
+
+local function snapshotProperties(inst: Instance, filter: { string }?): { [string]: any }
+	local props: { [string]: any } = {}
+	local list = filter or COMPARE_PROP_LIST
+	for _, propName in list do
+		local ok, val = pcall(function() return (inst :: any)[propName] end)
+		if ok then props[propName] = serializeProperty(val) end
+	end
+	return props
+end
+
+local function deepEqual(a: any, b: any): boolean
+	if a == b then return true end
+	if type(a) ~= type(b) then return false end
+	if type(a) ~= "table" then return false end
+	for k, v in a do if not deepEqual(v, b[k]) then return false end end
+	for k in b do if a[k] == nil then return false end end
+	return true
+end
+
+local function compareSubtree(a: Instance, b: Instance, relPath: string, propFilter: { string }?, includeChildren: boolean, acc: { propertyDiffs: {}, childrenOnlyInA: { string }, childrenOnlyInB: { string }, countA: number, countB: number })
+	acc.countA += 1
+	acc.countB += 1
+	local propsA = snapshotProperties(a, propFilter)
+	local propsB = snapshotProperties(b, propFilter)
+	local seen: { [string]: boolean } = {}
+	for prop, valA in propsA do
+		seen[prop] = true
+		if not deepEqual(valA, propsB[prop]) then
+			table.insert(acc.propertyDiffs, { path = relPath, prop = prop, valueA = valA, valueB = propsB[prop] })
+		end
+	end
+	for prop, valB in propsB do
+		if not seen[prop] and not deepEqual(propsA[prop], valB) then
+			table.insert(acc.propertyDiffs, { path = relPath, prop = prop, valueA = propsA[prop], valueB = valB })
+		end
+	end
+	if not includeChildren then return end
+	local childrenA = a:GetChildren()
+	local childrenB = b:GetChildren()
+	local matched: { [number]: boolean } = {}
+	for _, childA in childrenA do
+		local match: Instance? = nil
+		for i, childB in childrenB do
+			if not matched[i] and childB.Name == childA.Name and childB.ClassName == childA.ClassName then
+				match = childB
+				matched[i] = true
+				break
+			end
+		end
+		if match then
+			compareSubtree(childA, match, relPath .. "." .. childA.Name, propFilter, includeChildren, acc)
+		else
+			table.insert(acc.childrenOnlyInA, relPath .. "." .. childA.Name)
+			acc.countA += 1
+		end
+	end
+	for i, childB in childrenB do
+		if not matched[i] then
+			table.insert(acc.childrenOnlyInB, relPath .. "." .. childB.Name)
+			acc.countB += 1
+		end
+	end
+end
+
+handlers["compare_instances"] = function(params)
+	if not params or not params.pathA or not params.pathB then
+		return { success = false, error = "Missing required parameters: pathA, pathB" }
+	end
+	local instA = resolveInstance(params.pathA)
+	local instB = resolveInstance(params.pathB)
+	if not instA then return { success = false, error = "Instance not found: " .. tostring(params.pathA) } end
+	if not instB then return { success = false, error = "Instance not found: " .. tostring(params.pathB) } end
+	local includeChildren = if params.includeChildren == nil then true else params.includeChildren
+	local filter = params.propertyFilter
+	local acc = { propertyDiffs = {}, childrenOnlyInA = {}, childrenOnlyInB = {}, countA = 0, countB = 0 }
+	compareSubtree(instA, instB, instA.Name, filter, includeChildren, acc)
+	return { success = true, data = acc }
+end
+
+-- ============================================================================
+-- get_connected_instances (P1.3)
+-- ============================================================================
+
+-- Properties known to hold Instance references. Limited list keeps the scan fast.
+local OUTGOING_REF_PROPS = {
+	"Part0", "Part1", "Attachment0", "Attachment1", "RootPart", "PrimaryPart",
+	"Adornee", "Value", "ObjectValue", "Target", "Attachment", "Object",
+	"SoundGroup", "TextureID", "Image",
+}
+
+local function readRefProp(inst: Instance, propName: string): Instance?
+	local ok, val = pcall(function() return (inst :: any)[propName] end)
+	if not ok then return nil end
+	if typeof(val) == "Instance" then return val end
+	return nil
+end
+
+local function collectOutgoing(inst: Instance, results: {})
+	for _, propName in OUTGOING_REF_PROPS do
+		local target = readRefProp(inst, propName)
+		if target then
+			table.insert(results, {
+				sourcePath = getInstancePath(inst),
+				targetPath = getInstancePath(target),
+				propertyName = propName,
+				className = target.ClassName,
+			})
+		end
+	end
+end
+
+handlers["get_connected_instances"] = function(params)
+	if not params or not params.path then
+		return { success = false, error = "Missing required parameter: path" }
+	end
+	local inst = resolveInstance(params.path)
+	if not inst then return { success = false, error = "Instance not found: " .. tostring(params.path) } end
+	local direction = params.direction or "both"
+	local results = {}
+	local capped = false
+	if direction == "outgoing" or direction == "both" then
+		collectOutgoing(inst, results)
+	end
+	if direction == "incoming" or direction == "both" then
+		for _, other in game:GetDescendants() do
+			if other == inst then continue end
+			if #results >= 100 then capped = true; break end
+			for _, propName in OUTGOING_REF_PROPS do
+				local target = readRefProp(other, propName)
+				if target == inst then
+					table.insert(results, {
+						sourcePath = getInstancePath(other),
+						targetPath = getInstancePath(inst),
+						propertyName = propName,
+						className = inst.ClassName,
+					})
+				end
+			end
+		end
+	end
+	return { success = true, data = { connections = results, capped = capped } }
+end
+
+-- ============================================================================
+-- Planning Mode: snapshot_subtree + revert_subtree (P3.1)
+-- ============================================================================
+
+-- Properties worth capturing for a high-fidelity checkpoint. Richer than the
+-- export_build set — covers physics, geometry, materials, light, GUI, scripts,
+-- and ValueBase. Properties absent on a given class are silently skipped.
+local SNAPSHOT_PROPS = {
+	"Anchored", "CanCollide", "CanQuery", "CanTouch", "CastShadow", "Color",
+	"Material", "Reflectance", "Size", "Position", "Orientation", "CFrame",
+	"Transparency", "Shape", "TopSurface", "BottomSurface", "Massless",
+	"CustomPhysicalProperties", "BrickColor", "Name",
+	"Brightness", "Range", "Angle", "Face",
+	"Visible", "Text", "TextColor3", "TextSize", "BackgroundColor3",
+	"BackgroundTransparency", "BorderColor3", "BorderSizePixel", "Active",
+	"Value", "Disabled", "RunContext", "SourceAssetId",
+}
+
+-- Type-aware property serializer. Returns a JSON-safe value that the
+-- restore side can deserialize back to a Roblox type. Returns nil for
+-- types we can't safely round-trip (functions, threads, exotic userdata).
+local function serializePropValue(v: any): any
+	local t = typeof(v)
+	if t == "string" or t == "number" or t == "boolean" then return v end
+	if t == "nil" then return nil end
+	if t == "Vector3" then return { __t = "Vector3", x = v.X, y = v.Y, z = v.Z } end
+	if t == "Vector2" then return { __t = "Vector2", x = v.X, y = v.Y } end
+	if t == "Color3" then return { __t = "Color3", r = v.R, g = v.G, b = v.B } end
+	if t == "BrickColor" then return { __t = "BrickColor", name = v.Name } end
+	if t == "UDim" then return { __t = "UDim", scale = v.Scale, offset = v.Offset } end
+	if t == "UDim2" then return { __t = "UDim2", sx = v.X.Scale, ox = v.X.Offset, sy = v.Y.Scale, oy = v.Y.Offset } end
+	if t == "CFrame" then return { __t = "CFrame", components = { v:GetComponents() } } end
+	if t == "EnumItem" then return { __t = "EnumItem", enum = tostring(v.EnumType), name = v.Name } end
+	if t == "NumberSequence" then
+		local keys = {}
+		for _, k in v.Keypoints do
+			table.insert(keys, { time = k.Time, value = k.Value, envelope = k.Envelope })
+		end
+		return { __t = "NumberSequence", keypoints = keys }
+	end
+	if t == "ColorSequence" then
+		local keys = {}
+		for _, k in v.Keypoints do
+			table.insert(keys, { time = k.Time, r = k.Value.R, g = k.Value.G, b = k.Value.B })
+		end
+		return { __t = "ColorSequence", keypoints = keys }
+	end
+	if t == "Rect" then
+		return { __t = "Rect", minX = v.Min.X, minY = v.Min.Y, maxX = v.Max.X, maxY = v.Max.Y }
+	end
+	if t == "Instance" then
+		-- Cross-references are not preserved across revert; record a path
+		-- hint so the agent can see what was pointed at.
+		return { __t = "InstanceRef", path = getInstancePath(v) }
+	end
+	-- Fallback: tostring. Strings still round-trip into String-typed props.
+	return tostring(v)
+end
+
+local function snapshotInstance(obj: Instance): { [string]: any }
+	local node: { [string]: any } = {
+		className = obj.ClassName,
+		name = obj.Name,
+		properties = {},
+		attributes = {},
+		tags = {},
+		children = {},
+	}
+	for _, p in SNAPSHOT_PROPS do
+		local ok, v = pcall(function() return (obj :: any)[p] end)
+		if ok and v ~= nil then
+			local serialized = serializePropValue(v)
+			if serialized ~= nil then
+				node.properties[p] = serialized
+			end
+		end
+	end
+	-- Source for scripts so we can faithfully restore code state.
+	if obj:IsA("LuaSourceContainer") then
+		local srcOk, src = pcall(function() return ScriptEditorService:GetEditorSource(obj) end)
+		if srcOk then node.properties["Source"] = src end
+	end
+	for k, v in obj:GetAttributes() do
+		node.attributes[k] = serializePropValue(v)
+	end
+	for _, tag in CollectionService:GetTags(obj) do
+		table.insert(node.tags, tag)
+	end
+	for _, child in obj:GetChildren() do
+		table.insert(node.children, snapshotInstance(child))
+	end
+	return node
+end
+
+handlers["snapshot_subtree"] = function(params)
+	if not params or not params.scope or type(params.scope) ~= "table" then
+		return { success = false, error = "Missing required parameter: scope (array of instance paths)" }
+	end
+	local roots: { { path: string, snapshot: any } } = {}
+	local missing = {}
+	for _, path in params.scope do
+		local inst = resolveInstance(path)
+		if not inst then
+			table.insert(missing, path)
+		else
+			table.insert(roots, { path = path, parentPath = getInstancePath(inst.Parent or game), snapshot = snapshotInstance(inst) })
+		end
+	end
+	if #missing > 0 then
+		return { success = false, error = "Scope paths not found: " .. table.concat(missing, ", ") }
+	end
+	return { success = true, data = { roots = roots, capturedAt = os.time() } }
+end
+
+-- Inverse of serializePropValue. Restores a JSON-encoded property back to
+-- its native Roblox type. Returns nil for InstanceRef (we can't recreate
+-- arbitrary cross-references) and unknown tagged shapes.
+local function deserializePropValue(val: any): any
+	if type(val) ~= "table" then return val end
+	if val.__t == nil then return val end
+	local kind = val.__t
+	if kind == "Vector3" then return Vector3.new(val.x, val.y, val.z) end
+	if kind == "Vector2" then return Vector2.new(val.x, val.y) end
+	if kind == "Color3" then return Color3.new(val.r, val.g, val.b) end
+	if kind == "BrickColor" then
+		local ok, bc = pcall(function() return BrickColor.new(val.name) end)
+		if ok then return bc end
+		return nil
+	end
+	if kind == "UDim" then return UDim.new(val.scale, val.offset) end
+	if kind == "UDim2" then return UDim2.new(val.sx, val.ox, val.sy, val.oy) end
+	if kind == "CFrame" then
+		local c = val.components
+		if type(c) == "table" and #c >= 12 then
+			return CFrame.new(c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12])
+		end
+		return nil
+	end
+	if kind == "EnumItem" then
+		-- val.enum is like "Enum.Material"; resolve via the global Enum table.
+		local enumName = string.match(val.enum, "Enum%.(.+)$") or val.enum
+		local ok, enumObj = pcall(function() return (Enum :: any)[enumName] end)
+		if ok and enumObj then
+			local itemOk, item = pcall(function() return enumObj[val.name] end)
+			if itemOk then return item end
+		end
+		return nil
+	end
+	if kind == "NumberSequence" then
+		local keys = {}
+		for _, k in val.keypoints do
+			table.insert(keys, NumberSequenceKeypoint.new(k.time, k.value, k.envelope or 0))
+		end
+		return NumberSequence.new(keys)
+	end
+	if kind == "ColorSequence" then
+		local keys = {}
+		for _, k in val.keypoints do
+			table.insert(keys, ColorSequenceKeypoint.new(k.time, Color3.new(k.r, k.g, k.b)))
+		end
+		return ColorSequence.new(keys)
+	end
+	if kind == "Rect" then
+		return Rect.new(val.minX, val.minY, val.maxX, val.maxY)
+	end
+	if kind == "InstanceRef" then
+		-- Best-effort: try to resolve the path now; nil if it no longer exists.
+		return resolveInstance(val.path)
+	end
+	return nil
+end
+
+local function restoreInstance(node: any, parentInst: Instance): Instance?
+	local ok, inst = pcall(Instance.new, node.className)
+	if not ok or not inst then return nil end
+	inst.Name = node.name
+	-- Source first so script body restores before any descendants reference it.
+	if node.properties.Source and inst:IsA("LuaSourceContainer") then
+		pcall(function() ScriptEditorService:UpdateSourceAsync(inst, function() return node.properties.Source end) end)
+	end
+	for prop, val in node.properties do
+		if prop ~= "Source" and prop ~= "Name" then
+			local typedVal = deserializePropValue(val)
+			if typedVal ~= nil then
+				pcall(function() (inst :: any)[prop] = typedVal end)
+			end
+		end
+	end
+	for attrKey, attrVal in node.attributes or {} do
+		local typedVal = deserializePropValue(attrVal)
+		if typedVal ~= nil then
+			pcall(function() inst:SetAttribute(attrKey, typedVal) end)
+		end
+	end
+	for _, tag in node.tags or {} do
+		pcall(function() CollectionService:AddTag(inst, tag) end)
+	end
+	inst.Parent = parentInst
+	for _, childNode in node.children or {} do
+		restoreInstance(childNode, inst)
+	end
+	return inst
+end
+
+handlers["revert_subtree"] = function(params)
+	if not params or not params.scope or not params.snapshot then
+		return { success = false, error = "Missing required parameters: scope, snapshot" }
+	end
+	local roots = params.snapshot.roots
+	if type(roots) ~= "table" then
+		return { success = false, error = "Snapshot has no roots[] — bad payload" }
+	end
+	ChangeHistoryService:SetWaypoint("LS:revert checkpoint")
+	local restored = 0
+	local scripts = 0
+	for _, entry in roots do
+		local parentInst = resolveInstance(entry.parentPath)
+		if parentInst then
+			-- Delete the existing instance at entry.path if it still exists; then
+			-- rebuild from snapshot. This is the simplest semantic match for
+			-- "restore the subtree to exactly the captured state."
+			local existing = resolveInstance(entry.path)
+			if existing then existing:Destroy() end
+			local function countScripts(node: any): number
+				local n = if node.className and string.find(node.className, "Script") then 1 else 0
+				for _, child in node.children or {} do n += countScripts(child) end
+				return n
+			end
+			local function countAll(node: any): number
+				local n = 1
+				for _, child in node.children or {} do n += countAll(child) end
+				return n
+			end
+			restoreInstance(entry.snapshot, parentInst)
+			restored += countAll(entry.snapshot)
+			scripts += countScripts(entry.snapshot)
+		end
+	end
+	ChangeHistoryService:SetWaypoint("LS:reverted checkpoint")
+	return { success = true, data = { restoredInstances = restored, restoredScripts = scripts } }
 end
 
 -- Count registered handlers for status display
 local HANDLER_COUNT = 0
 for _ in handlers do HANDLER_COUNT += 1 end
 toolsRow.Text = "Tools: " .. HANDLER_COUNT .. " registered"
+
+-- Copy LS Handle toolbar button — pulls or creates a stable id for each
+-- selected instance and writes a `ls://<uuid>` list to the clipboard.
+copyHandleButton.Click:Connect(function()
+	if INSPECTOR_ONLY then
+		showToast("Inspector build: cannot mint new handles. Use the standard plugin.", "error")
+		return
+	end
+	local selection = Selection:Get()
+	if #selection == 0 then
+		showToast("Select one or more instances first", "error")
+		return
+	end
+	local handles = {}
+	for _, inst in selection do
+		local existing = inst:GetAttribute("LSStableId")
+		local id: string
+		if type(existing) == "string" and existing ~= "" then
+			id = existing
+		else
+			id = HttpService:GenerateGUID(false)
+			ChangeHistoryService:SetWaypoint("LS:tag stable id")
+			inst:SetAttribute("LSStableId", id)
+			ChangeHistoryService:SetWaypoint("LS:tagged stable id")
+		end
+		stableIdIndex[id] = inst
+		table.insert(handles, "ls://" .. id)
+	end
+	local payload = table.concat(handles, "\n")
+	local ok, errMsg = pcall(function() plugin:SetClipboard(payload) end)
+	if ok then
+		showToast(string.format("Copied %d handle(s)", #handles), "success")
+	else
+		showToast("Clipboard error: " .. tostring(errMsg), "error")
+	end
+end)
 
 -- ============================================================================
 -- Main Communication Loop
@@ -4635,7 +5445,9 @@ local function pollForWork()
 		local startTime = os.clock()
 		local handler = handlers[request.action]
 		local response
-		if handler then
+		if INSPECTOR_ONLY and not READ_ONLY_TOOLS[request.action] then
+			response = { success = false, error = "Inspector build: write tools are disabled. Install the standard Linkedsword plugin to use '" .. tostring(request.action) .. "'." }
+		elseif handler then
 			local handlerOk, handlerResult = pcall(handler, request.params or {})
 			response = handlerOk and handlerResult or { success = false, error = "Handler error: " .. tostring(handlerResult) }
 		else

@@ -35,7 +35,7 @@ export async function callStudio(
   bridge: HttpBridge,
   tool: string,
   params: Record<string, unknown>,
-): ReturnType<typeof success> | ReturnType<typeof error> {
+): Promise<ReturnType<typeof success> | ReturnType<typeof error>> {
   const result = await bridge.sendToStudio(tool, params);
   if (result.success) {
     return success(result.data);

@@ -16,6 +16,7 @@ import {
   ScriptDiff,
   ResolvedDiff,
   LSConfig,
+  AutoAcceptBudget,
 } from "../types.js";
 import {
   DEFAULT_PORT,
@@ -34,6 +35,7 @@ export class HttpBridge {
   private diffQueue: Map<string, ScriptDiff> = new Map();
   private diffHistory: ResolvedDiff[] = [];
   private config: LSConfig;
+  private autoAcceptBudget: AutoAcceptBudget = { mode: "off", remaining: 0, setAt: 0 };
 
   // Long-poll waiters — plugin sits here until we have work
   private pollWaiters: Array<{
@@ -137,7 +139,7 @@ export class HttpBridge {
   // --------------------------------------------------------------------------
 
   private handlePoll(req: Request, res: Response): void {
-    const instanceId = req.params.instanceId;
+    const instanceId = String(req.params.instanceId);
 
     if (!this.studioInstances.has(instanceId)) {
       res.status(404).json({ error: "Instance not registered. Send heartbeat first." });
@@ -374,6 +376,42 @@ export class HttpBridge {
     Object.assign(this.config, updates);
   }
 
+  /** Get current auto-accept budget state */
+  getAutoAcceptBudget(): AutoAcceptBudget {
+    return { ...this.autoAcceptBudget };
+  }
+
+  /** Set the auto-accept budget. `count` required when scope=next_n. */
+  setAutoAcceptBudget(scope: "off" | "next_n" | "session", count?: number): AutoAcceptBudget {
+    if (scope === "next_n") {
+      this.autoAcceptBudget = { mode: "next_n", remaining: count ?? 1, setAt: Date.now() };
+    } else if (scope === "session") {
+      this.autoAcceptBudget = { mode: "session", remaining: null, setAt: Date.now() };
+    } else {
+      this.autoAcceptBudget = { mode: "off", remaining: 0, setAt: Date.now() };
+    }
+    return this.getAutoAcceptBudget();
+  }
+
+  /**
+   * Decide whether the next staged diff should be auto-applied.
+   * Returns true when the global `autoAccept` flag is on OR the session budget
+   * is active. For `next_n`, this consumes one unit of budget per call — only
+   * invoke this once per staged diff, at the decision point.
+   */
+  shouldAutoAccept(): boolean {
+    if (this.config.autoAccept) return true;
+    if (this.autoAcceptBudget.mode === "session") return true;
+    if (this.autoAcceptBudget.mode === "next_n" && (this.autoAcceptBudget.remaining ?? 0) > 0) {
+      this.autoAcceptBudget.remaining = (this.autoAcceptBudget.remaining ?? 1) - 1;
+      if ((this.autoAcceptBudget.remaining ?? 0) <= 0) {
+        this.autoAcceptBudget = { mode: "off", remaining: 0, setAt: Date.now() };
+      }
+      return true;
+    }
+    return false;
+  }
+
   /** Start the HTTP server */
   start(): Promise<void> {
     return new Promise((resolve) => {
@@ -430,6 +468,10 @@ export class HttpBridge {
       "list_roblox_studios", "get_diff_queue", "get_activity_log",
       "get_diff_history", "capture_screenshot", "get_bounding_box",
       "get_descendants", "get_console_output", "raycast",
+      // Phase 1+2 parity additions
+      "resolve_stable_id", "compare_instances", "get_connected_instances",
+      "parallel_search", "get_auto_accept_status",
+      "search_assets", "get_asset_details", "get_asset_thumbnail",
     ]);
     return readOnlyTools.has(tool);
   }

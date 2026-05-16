@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { z } from "zod";
-import { ToolRegistrar, callStudio } from "./_helpers.js";
+import { ToolRegistrar, callStudio, success } from "./_helpers.js";
 
 export const registerSearchTools: ToolRegistrar = (server, bridge) => {
   server.registerTool("search_files", {
@@ -182,4 +182,138 @@ Returns: Array of { name, path, className } descendants.`,
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async (params) => callStudio(bridge, "get_descendants", params));
+
+  server.registerTool("get_stable_id", {
+    title: "Get stable instance handle",
+    description: `Get a stable text handle (\`ls://<uuid>\`) for an instance. The handle survives rename and reparent — pass it back to any tool that accepts a path. Idempotent: subsequent calls return the same id.
+
+Args:
+  - path (string): Current instance path (or an existing ls:// handle)
+
+Returns: { id, path, reused }`,
+    inputSchema: {
+      path: z.string().describe("Instance path or existing ls:// handle"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (params) => callStudio(bridge, "get_stable_id", params));
+
+  server.registerTool("resolve_stable_id", {
+    title: "Resolve stable handle to path",
+    description: `Resolve a stable handle (\`ls://<uuid>\`) back to a current instance path and metadata.
+
+Args:
+  - id (string): Stable id (the part after \`ls://\`, or the full handle)
+
+Returns: { exists, path?, className?, name? }`,
+    inputSchema: {
+      id: z.string().describe("Stable id"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (params) => {
+    const id = params.id.startsWith("ls://") ? params.id.slice(5) : params.id;
+    return callStudio(bridge, "resolve_stable_id", { id });
+  });
+
+  server.registerTool("compare_instances", {
+    title: "Compare two instance subtrees",
+    description: `Structural diff of two instance subtrees. Compares a curated set of properties plus child-by-name matching.
+
+Args:
+  - pathA (string): First instance
+  - pathB (string): Second instance
+  - includeChildren (bool, default true): Recurse into children
+  - propertyFilter (string[], optional): Restrict to these properties
+
+Returns: { propertyDiffs[], childrenOnlyInA[], childrenOnlyInB[], countA, countB }`,
+    inputSchema: {
+      pathA: z.string().describe("First instance path"),
+      pathB: z.string().describe("Second instance path"),
+      includeChildren: z.boolean().default(true).describe("Recurse into children"),
+      propertyFilter: z.array(z.string()).optional().describe("Restrict comparison to these property names"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (params) => callStudio(bridge, "compare_instances", params));
+
+  server.registerTool("get_connected_instances", {
+    title: "Find instances connected via references",
+    description: `Returns instances connected to the given one through known Instance-valued properties (Part0/Part1, Attachment0/1, Adornee, ObjectValue.Value, PrimaryPart, etc.).
+
+Args:
+  - path (string): Source instance
+  - direction (enum "outgoing"|"incoming"|"both", default "both")
+
+Note: \`incoming\` scans the DataModel and is capped at 100 results — large places may report \`capped: true\`.`,
+    inputSchema: {
+      path: z.string().describe("Source instance path"),
+      direction: z.enum(["outgoing", "incoming", "both"]).default("both").describe("Reference direction"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (params) => callStudio(bridge, "get_connected_instances", params));
+
+  server.registerTool("parallel_search", {
+    title: "Parallel data-model search",
+    description: `Run up to 5 search queries concurrently and return compact summaries. Fan-out is internally batched 3-at-a-time to avoid Studio heartbeat timeouts.
+
+Each query routes to one of:
+  - "objects": search_objects
+  - "scripts": grep_scripts
+  - "property": search_by_property
+  - "descendants": get_descendants
+
+Args:
+  - queries (array of { type, params, label }), 1-5 entries
+  - summaryOnly (boolean, default true): truncate each result body to first 5 items + count
+
+Returns: { results: { [label]: { count, sample, raw? } }, durationMs }`,
+    inputSchema: {
+      queries: z.array(z.object({
+        type: z.enum(["objects", "scripts", "property", "descendants"]),
+        params: z.record(z.unknown()),
+        label: z.string(),
+      })).min(1).max(5).describe("Queries to fan out"),
+      summaryOnly: z.boolean().default(true).describe("Truncate result bodies for context efficiency"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (params) => {
+    const TYPE_TO_TOOL: Record<string, string> = {
+      objects: "search_objects",
+      scripts: "grep_scripts",
+      property: "search_by_property",
+      descendants: "get_descendants",
+    };
+    const start = Date.now();
+    const results: Record<string, { count: number; sample: unknown[]; raw?: unknown }> = {};
+
+    // Batch in groups of 3 to stay under the heartbeat-timeout threshold.
+    const BATCH = 3;
+    for (let i = 0; i < params.queries.length; i += BATCH) {
+      const batch = params.queries.slice(i, i + BATCH);
+      const responses = await Promise.all(batch.map((q) =>
+        bridge.sendToStudio(TYPE_TO_TOOL[q.type], q.params as Record<string, unknown>),
+      ));
+      batch.forEach((q, idx) => {
+        const resp = responses[idx];
+        if (!resp.success) {
+          results[q.label] = { count: 0, sample: [], raw: { error: resp.error } };
+          return;
+        }
+        const data = resp.data as unknown;
+        let items: unknown[] = [];
+        if (Array.isArray(data)) items = data;
+        else if (data && typeof data === "object") {
+          const obj = data as Record<string, unknown>;
+          for (const key of ["results", "matches", "items", "descendants", "objects", "data"]) {
+            if (Array.isArray(obj[key])) { items = obj[key] as unknown[]; break; }
+          }
+          if (items.length === 0) items = [data];
+        }
+        const sample = items.slice(0, 5);
+        results[q.label] = params.summaryOnly
+          ? { count: items.length, sample }
+          : { count: items.length, sample, raw: data };
+      });
+    }
+
+    return success({ results, durationMs: Date.now() - start });
+  });
 };

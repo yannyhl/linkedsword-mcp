@@ -114,6 +114,13 @@ export interface LSConfig {
   requestTimeout: number;
 }
 
+/** Auto-accept budget state — bounds how many diffs auto-apply without review */
+export interface AutoAcceptBudget {
+  mode: "off" | "next_n" | "session";
+  remaining: number | null;  // null for "session"; integer for "next_n"
+  setAt: number;             // epoch ms
+}
+
 /** Studio instance info for multi-instance support */
 export interface StudioInstance {
   id: string;

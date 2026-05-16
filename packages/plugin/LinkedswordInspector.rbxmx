@@ -1,4 +1,10 @@
---[[
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX0">
+		<Properties>
+			<string name="Name">LinkedswordInspector</string>
+			<ProtectedString name="Source"><![CDATA[--[[
 	Linkedsword — Roblox Studio MCP Plugin
 	Agentic AI bridge with script diff review, activity feed, and a sleeping cat.
 
@@ -34,7 +40,7 @@ local MAX_RETRY_ATTEMPTS = 3
 -- Inspector-build flag. Default `false`; the `--inspector` build target in
 -- packages/plugin/build-rbxmx.js rewrites this to `true` at build time so
 -- write tools are physically disabled in the distributed inspector plugin.
-local INSPECTOR_ONLY = false
+local INSPECTOR_ONLY = true
 
 -- Tools allowed when INSPECTOR_ONLY is true. Must match the read-only allowlist
 -- maintained server-side in services/bridge.ts (isReadOnlyTool).
@@ -5134,47 +5140,6 @@ local SNAPSHOT_PROPS = {
 	"Value", "Disabled", "RunContext", "SourceAssetId",
 }
 
--- Type-aware property serializer. Returns a JSON-safe value that the
--- restore side can deserialize back to a Roblox type. Returns nil for
--- types we can't safely round-trip (functions, threads, exotic userdata).
-local function serializePropValue(v: any): any
-	local t = typeof(v)
-	if t == "string" or t == "number" or t == "boolean" then return v end
-	if t == "nil" then return nil end
-	if t == "Vector3" then return { __t = "Vector3", x = v.X, y = v.Y, z = v.Z } end
-	if t == "Vector2" then return { __t = "Vector2", x = v.X, y = v.Y } end
-	if t == "Color3" then return { __t = "Color3", r = v.R, g = v.G, b = v.B } end
-	if t == "BrickColor" then return { __t = "BrickColor", name = v.Name } end
-	if t == "UDim" then return { __t = "UDim", scale = v.Scale, offset = v.Offset } end
-	if t == "UDim2" then return { __t = "UDim2", sx = v.X.Scale, ox = v.X.Offset, sy = v.Y.Scale, oy = v.Y.Offset } end
-	if t == "CFrame" then return { __t = "CFrame", components = { v:GetComponents() } } end
-	if t == "EnumItem" then return { __t = "EnumItem", enum = tostring(v.EnumType), name = v.Name } end
-	if t == "NumberSequence" then
-		local keys = {}
-		for _, k in v.Keypoints do
-			table.insert(keys, { time = k.Time, value = k.Value, envelope = k.Envelope })
-		end
-		return { __t = "NumberSequence", keypoints = keys }
-	end
-	if t == "ColorSequence" then
-		local keys = {}
-		for _, k in v.Keypoints do
-			table.insert(keys, { time = k.Time, r = k.Value.R, g = k.Value.G, b = k.Value.B })
-		end
-		return { __t = "ColorSequence", keypoints = keys }
-	end
-	if t == "Rect" then
-		return { __t = "Rect", minX = v.Min.X, minY = v.Min.Y, maxX = v.Max.X, maxY = v.Max.Y }
-	end
-	if t == "Instance" then
-		-- Cross-references are not preserved across revert; record a path
-		-- hint so the agent can see what was pointed at.
-		return { __t = "InstanceRef", path = getInstancePath(v) }
-	end
-	-- Fallback: tostring. Strings still round-trip into String-typed props.
-	return tostring(v)
-end
-
 local function snapshotInstance(obj: Instance): { [string]: any }
 	local node: { [string]: any } = {
 		className = obj.ClassName,
@@ -5187,10 +5152,10 @@ local function snapshotInstance(obj: Instance): { [string]: any }
 	for _, p in SNAPSHOT_PROPS do
 		local ok, v = pcall(function() return (obj :: any)[p] end)
 		if ok and v ~= nil then
-			local serialized = serializePropValue(v)
-			if serialized ~= nil then
-				node.properties[p] = serialized
-			end
+			-- Stash as tostring; the revert side replays through pcall property
+			-- setters with the stringified form, matching the existing
+			-- import_build pattern.
+			node.properties[p] = tostring(v)
 		end
 	end
 	-- Source for scripts so we can faithfully restore code state.
@@ -5199,7 +5164,7 @@ local function snapshotInstance(obj: Instance): { [string]: any }
 		if srcOk then node.properties["Source"] = src end
 	end
 	for k, v in obj:GetAttributes() do
-		node.attributes[k] = serializePropValue(v)
+		node.attributes[k] = v
 	end
 	for _, tag in CollectionService:GetTags(obj) do
 		table.insert(node.tags, tag)
@@ -5230,64 +5195,6 @@ handlers["snapshot_subtree"] = function(params)
 	return { success = true, data = { roots = roots, capturedAt = os.time() } }
 end
 
--- Inverse of serializePropValue. Restores a JSON-encoded property back to
--- its native Roblox type. Returns nil for InstanceRef (we can't recreate
--- arbitrary cross-references) and unknown tagged shapes.
-local function deserializePropValue(val: any): any
-	if type(val) ~= "table" then return val end
-	if val.__t == nil then return val end
-	local kind = val.__t
-	if kind == "Vector3" then return Vector3.new(val.x, val.y, val.z) end
-	if kind == "Vector2" then return Vector2.new(val.x, val.y) end
-	if kind == "Color3" then return Color3.new(val.r, val.g, val.b) end
-	if kind == "BrickColor" then
-		local ok, bc = pcall(function() return BrickColor.new(val.name) end)
-		if ok then return bc end
-		return nil
-	end
-	if kind == "UDim" then return UDim.new(val.scale, val.offset) end
-	if kind == "UDim2" then return UDim2.new(val.sx, val.ox, val.sy, val.oy) end
-	if kind == "CFrame" then
-		local c = val.components
-		if type(c) == "table" and #c >= 12 then
-			return CFrame.new(c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12])
-		end
-		return nil
-	end
-	if kind == "EnumItem" then
-		-- val.enum is like "Enum.Material"; resolve via the global Enum table.
-		local enumName = string.match(val.enum, "Enum%.(.+)$") or val.enum
-		local ok, enumObj = pcall(function() return (Enum :: any)[enumName] end)
-		if ok and enumObj then
-			local itemOk, item = pcall(function() return enumObj[val.name] end)
-			if itemOk then return item end
-		end
-		return nil
-	end
-	if kind == "NumberSequence" then
-		local keys = {}
-		for _, k in val.keypoints do
-			table.insert(keys, NumberSequenceKeypoint.new(k.time, k.value, k.envelope or 0))
-		end
-		return NumberSequence.new(keys)
-	end
-	if kind == "ColorSequence" then
-		local keys = {}
-		for _, k in val.keypoints do
-			table.insert(keys, ColorSequenceKeypoint.new(k.time, Color3.new(k.r, k.g, k.b)))
-		end
-		return ColorSequence.new(keys)
-	end
-	if kind == "Rect" then
-		return Rect.new(val.minX, val.minY, val.maxX, val.maxY)
-	end
-	if kind == "InstanceRef" then
-		-- Best-effort: try to resolve the path now; nil if it no longer exists.
-		return resolveInstance(val.path)
-	end
-	return nil
-end
-
 local function restoreInstance(node: any, parentInst: Instance): Instance?
 	local ok, inst = pcall(Instance.new, node.className)
 	if not ok or not inst then return nil end
@@ -5298,17 +5205,11 @@ local function restoreInstance(node: any, parentInst: Instance): Instance?
 	end
 	for prop, val in node.properties do
 		if prop ~= "Source" and prop ~= "Name" then
-			local typedVal = deserializePropValue(val)
-			if typedVal ~= nil then
-				pcall(function() (inst :: any)[prop] = typedVal end)
-			end
+			pcall(function() (inst :: any)[prop] = val end)
 		end
 	end
 	for attrKey, attrVal in node.attributes or {} do
-		local typedVal = deserializePropValue(attrVal)
-		if typedVal ~= nil then
-			pcall(function() inst:SetAttribute(attrKey, typedVal) end)
-		end
+		pcall(function() inst:SetAttribute(attrKey, attrVal) end)
 	end
 	for _, tag in node.tags or {} do
 		pcall(function() CollectionService:AddTag(inst, tag) end)
@@ -5537,3 +5438,10 @@ end)
 
 -- Initial state
 updateStatus("disconnected", "Click toolbar button to connect")
+]]></ProtectedString>
+			<bool name="Disabled">false</bool>
+			<Content name="LinkedSource"><null></null></Content>
+			<token name="RunContext">0</token>
+		</Properties>
+	</Item>
+</roblox>

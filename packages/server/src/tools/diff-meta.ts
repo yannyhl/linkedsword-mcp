@@ -222,12 +222,13 @@ Returns: Array of { name, path, className } for tagged instances.`,
   }, async (params) => callStudio(bridge, "get_tagged", params));
 
   server.registerTool("capture_screenshot", {
-    title: "Capture viewport screenshot",
-    description: `Capture a screenshot of the current Studio viewport.
+    title: "Get viewport info",
+    description: `Get metadata about the current Studio viewport — camera position, look direction, FOV, and visible objects.
+Note: Pixel capture is not available in Studio plugins. This returns camera metadata for spatial reasoning.
 
-Returns: { imageData: string } — base64-encoded PNG.`,
+Returns: { position, lookVector, fieldOfView, viewportSize, visibleObjects[] }`,
     inputSchema: {},
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async () => callStudio(bridge, "capture_screenshot", {}));
 
   // Build library tools
@@ -369,18 +370,57 @@ Returns: Confirmation of redo.`,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, async (params) => callStudio(bridge, "redo", params));
 
+  server.registerTool("set_auto_accept", {
+    title: "Set auto-accept budget",
+    description: `Control how the next staged script diffs are handled. Three scopes:
+- "off": Every diff stages and waits for human review (default).
+- "next_n": Auto-apply the next N diffs without review, then revert to "off". Pass \`count\`.
+- "session": Auto-apply every diff until explicitly turned off or the plugin reconnects.
+
+Args:
+  - scope (enum): "off" | "next_n" | "session"
+  - count (number, optional): Required for "next_n". Range 1-50.
+
+Returns: { mode, remaining }.`,
+    inputSchema: {
+      scope: z.enum(["off", "next_n", "session"]).describe("Budget scope"),
+      count: z.number().int().min(1).max(50).optional().describe("Diff count for next_n"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, async (params) => {
+    if (params.scope === "next_n" && !params.count) {
+      return error("count is required when scope is 'next_n'");
+    }
+    const budget = bridge.setAutoAcceptBudget(params.scope, params.count);
+    return success({ mode: budget.mode, remaining: budget.remaining, setAt: budget.setAt });
+  });
+
+  server.registerTool("get_auto_accept_status", {
+    title: "Get auto-accept budget status",
+    description: `Read the current auto-accept budget state.
+
+Returns: { mode, remaining }. \`remaining\` is null for "session", an integer for "next_n", and 0 for "off".`,
+    inputSchema: {},
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async () => {
+    const budget = bridge.getAutoAcceptBudget();
+    return success({ mode: budget.mode, remaining: budget.remaining, setAt: budget.setAt });
+  });
+
   server.registerTool("get_console_output", {
     title: "Get console output",
-    description: `Get console logs (print, warn, error) from Studio's output panel.
+    description: `Get console logs (print, warn, error) from Studio's Output panel. Captures continuously from plugin startup — not just during playtest.
 
 Args:
   - since (number, optional): Only return logs after this timestamp
   - limit (number, optional): Max logs to return (default: 100, max: 500)
+  - type (enum "all"|"output"|"warning"|"error", default "all"): Filter by log level
 
 Returns: Array of { type, message, timestamp } log entries.`,
     inputSchema: {
       since: z.number().optional().describe("Timestamp to get logs after"),
       limit: z.number().int().min(1).max(500).default(100).describe("Max logs to return"),
+      type: z.enum(["all", "output", "warning", "error"]).default("all").describe("Filter by log level"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async (params) => callStudio(bridge, "get_console_output", params));
