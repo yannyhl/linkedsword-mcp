@@ -1,444 +1,155 @@
-# Linkedsword Docs
+# Linkedsword internals
 
-This is the central handbook for understanding how Linkedsword works as an MCP-backed Roblox Studio engineering loop.
+Architecture and tool reference. The public README is the right starting point for installing and using the project; this doc is for working on it.
 
-If you are an LLM, agent, or operator, read this file before making changes. It is intended to connect:
+## Stack
 
-- the repo layout
-- the MCP server surface area
-- the Roblox Studio plugin behavior
-- the real request/response lifecycle
-- the current implementation limits
+Two runtime pieces:
 
-## What Linkedsword Is
+1. Node/TypeScript MCP server in `packages/server`
+2. Roblox Studio plugin (single Luau file) in `packages/plugin/src/plugin.luau`
 
-Linkedsword is a local Roblox Studio MCP stack with two runtime pieces:
+The MCP client talks to the server over stdio. The server holds an Express bridge on `127.0.0.1:3003`. The plugin long-polls the bridge for work and posts results back.
 
-1. A Node/TypeScript MCP server in `packages/server`
-2. A Roblox Studio plugin in `packages/plugin/src/plugin.luau`
-
-The MCP server talks to an MCP client over `stdio`, and talks to the Studio plugin over a local HTTP bridge on `127.0.0.1:3003` by default.
-
-In practice, that means:
-
-- Cursor / Claude / another MCP client sends a tool call to Linkedsword
-- Linkedsword forwards the request to the connected Studio plugin
-- the plugin executes against the live DataModel in Studio
-- the result comes back through the bridge and is returned to the LLM
-
-## System Diagram
-
-```text
-LLM / MCP Client
-  -> stdio
-Linkedsword MCP Server (`packages/server/src/index.ts`)
-  -> in-memory bridge + request queue
-HTTP Bridge (`packages/server/src/services/bridge.ts`)
-  -> http://127.0.0.1:3003
-Roblox Studio Plugin (`packages/plugin/src/plugin.luau`)
-  -> DataModel / ScriptEditorService / Selection / ChangeHistoryService / RunService
-Roblox Studio Place
+```
+MCP client ──stdio──> server (Node) ──HTTP──> plugin (Luau) ──> DataModel
 ```
 
-## Repo Map
+## Repo map
 
-### Top level
+```
+packages/server/src/
+  index.ts                # boot, CLI dispatch, tool registration
+  constants.ts            # port, timeouts, version
+  types.ts                # bridge + diff shared types
+  services/
+    bridge.ts             # long-poll HTTP bridge, mode gating
+    diff-engine.ts        # hunk diff generation
+    auth.ts               # ~/.linkedsword/auth.json loader
+    plan-engine.ts        # plan + checkpoint persistence
+  tools/
+    navigation.ts         # data model traversal
+    search.ts             # discovery, compare, connected refs, parallel search
+    script.ts             # read, set, patch, line edits, grep-replace
+    instance.ts           # create, delete, set, batch, duplicate, group
+    playtest.ts           # start/stop, virtual input, character nav, scenario runner
+    spatial.ts            # welds, raycast, bounding box, terrain
+    assets.ts             # upload, Creator Store search, thumbnails
+    plan.ts               # plans + checkpoints
+    diff-meta.ts          # diff queue, attributes, tags, build library, console
+  cli.ts                  # `install` (Quick Connect), `auth set/show`
 
-- `README.md`: public-facing overview and quick start
-- `docs/README.md`: the internal operator + LLM handbook
-- `.mcp.json.example`: template for local MCP config (copy to `.mcp.json`)
-- `.claude/settings.json`: allowed Linkedsword tools and local permissions for Claude
-- `package.json`: root workspace scripts
+packages/plugin/
+  src/plugin.luau         # plugin source (monolithic)
+  build-rbxmx.js          # CDATA-wraps the Luau into an .rbxmx
+  Linkedsword.rbxmx       # built normal plugin
+  LinkedswordInspector.rbxmx  # built inspector-only variant
+```
 
-### Server
+## Request lifecycle
 
-- `packages/server/src/index.ts`: boots the MCP server, HTTP bridge, and tool registrars
-- `packages/server/src/constants.ts`: port, timeouts, version, limits
-- `packages/server/src/types.ts`: shared server-side bridge and diff types
-- `packages/server/src/services/bridge.ts`: long-poll bridge between Node and Studio
-- `packages/server/src/services/diff-engine.ts`: structured hunk diff generation
-- `packages/server/src/tools/*.ts`: MCP tool registration grouped by domain
+1. **Server boot.** `index.ts` creates an `McpServer`, an `HttpBridge`, and runs each `register*Tools(server, bridge)`. The bridge starts listening; the MCP server connects over stdio.
+2. **Plugin connect.** The plugin POSTs `/heartbeat` and long-polls `/poll/:instanceId`.
+3. **Tool call.** MCP client sends a tool request. The server validates with zod, then either resolves locally (e.g. plan engine state) or pushes the request onto the bridge queue.
+4. **Plugin execute.** The poll resolves with `{id, action, params}`. The plugin dispatches to `handlers[action]` and POSTs the response.
+5. **Response.** The bridge resolves the pending Promise; the tool handler returns content back through stdio.
 
-### Plugin
+## Modes
 
-- `packages/plugin/src/plugin.luau`: single-file plugin containing:
-- connection loop
-- tool handlers
-- diff review UI
-- activity feed
-- settings UI
-- mascot animation
+The bridge enforces a `mode` field (`full` | `inspector`). In inspector mode `handlePoll` rejects any tool not in the read-only allowlist (`isReadOnlyTool` in `bridge.ts`). Inspector mode is also available as a separate plugin build — `node packages/plugin/build-rbxmx.js --inspector` emits `LinkedswordInspector.rbxmx` with the `INSPECTOR_ONLY` flag flipped, which adds a second guard at the plugin dispatch site.
 
-This plugin file is currently monolithic. Most of the "what actually happens in Studio" lives there.
+## Script edits
 
-## Runtime Flow
+Script-editing tools (`set_script_source`, `patch_script`, `edit_script_lines`, etc.) follow a diff-staging flow:
 
-### 1. Server startup
+1. Fetch current source via `get_script_source`.
+2. Compute new source (splice lines, find/replace, etc.).
+3. If auto-accept is on (global flag or session/next-N budget), write directly via `set_script_source_direct`.
+4. Otherwise compute a structured diff in `diff-engine.ts`, push it onto the bridge's `diffQueue`, send a `stage_diff` request to the plugin, and return a summary.
+5. The plugin renders the diff in a pop-out window. The user accepts or rejects per file or per hunk; the resolved diff is archived to `diffHistory`.
 
-The Node entrypoint creates:
+## Auto-accept budgets
 
-- an `McpServer`
-- an `HttpBridge`
-- all tool registrars
+Three modes managed by `bridge.shouldAutoAccept()`:
 
-Then it starts the HTTP bridge and connects the MCP server over stdio.
+- `off`: every diff stages and waits for review.
+- `next_n`: the next N diffs auto-apply; each accept consumes one budget unit. When it hits zero, the bridge flips back to `off`.
+- `session`: every diff auto-applies until the budget is explicitly turned off or the plugin reconnects.
 
-Relevant files:
+Set via the `set_auto_accept` tool; inspect via `get_auto_accept_status`.
 
-- `packages/server/src/index.ts`
-- `packages/server/src/services/bridge.ts`
+## Planning Mode
 
-### 2. Plugin connection
+`packages/server/src/services/plan-engine.ts` keeps plans and checkpoints in memory and persists them under `~/.linkedsword/`:
 
-The Studio plugin:
+```
+~/.linkedsword/
+  plans/<planId>.json
+  checkpoints/<checkpointId>.json       # snapshot body
+  checkpoints/<checkpointId>.meta.json  # metadata only (loaded on boot)
+```
 
-- generates an `instanceId`
-- POSTs heartbeat messages to `/heartbeat`
-- long-polls `/poll/:instanceId`
-- executes incoming tool requests
-- POSTs results to `/response`
+Bodies are loaded lazily on revert so boot stays cheap. Caps: 50 active plans, 10 checkpoints per plan (oldest evicted, with cascade cleanup if a plan is deleted).
 
-Relevant plugin helpers:
+The plugin handlers `snapshot_subtree` and `revert_subtree` do the heavy work. Snapshots include serialized properties (Vector3, Color3, CFrame, EnumItem, UDim2, NumberSequence, ColorSequence, Rect, BrickColor, Instance refs — tagged `{__t: ...}` for type-aware restore), attributes, tags, and script source. Revert destroys the existing instance and rebuilds from the snapshot inside a single `ChangeHistoryService:SetWaypoint` pair so one Ctrl+Z still works.
 
-- `httpGet()`
-- `httpPost()`
-- `mainLoop()`
-- `pollForWork()`
+## Playtest scenarios
 
-All of these live in `packages/plugin/src/plugin.luau`.
+`run_playtest_scenario` orchestrates the existing playtest primitives:
 
-### 3. Tool execution
+1. `start_playtest`.
+2. Loop the step list: `wait`, `key`, `mouse`, `navigate`, `execute`, `assert`.
+3. Assertions wrap user Luau in a `pcall` plus a sentinel print (`LS_ASSERT_PASS` / `LS_ASSERT_FAIL` / `LS_ASSERT_ERROR:...`) that the server reads off the captured output.
+4. `stop_playtest` always runs at the end, even on failure.
 
-Most server tools are thin wrappers:
+Verdicts: `pass`, `fail`, `inconclusive` (max duration hit or loop detected), `error`.
 
-- validate input with `zod`
-- call `bridge.sendToStudio(...)`
-- format the response for MCP
+## Assets
 
-Shared helper:
+`packages/server/src/tools/assets.ts` handles uploads via Open Cloud (`https://apis.roblox.com/assets/v1/assets`) or the legacy publish endpoint with a `ROBLOSECURITY` cookie (Decal only). Credentials live in `~/.linkedsword/auth.json` loaded by `services/auth.ts`; `npx linkedsword-mcp-server auth set` writes the file at mode `0600`.
 
-- `packages/server/src/tools/_helpers.ts`
+Creator Store search (`search_assets`, `get_asset_details`, `get_asset_thumbnail`) hits public catalog endpoints — no auth needed. The catalog API only accepts `Limit ∈ {10, 28, 30, 60, 120}`, so the tool clamps the requested limit up to the next allowed value, and string asset names (`Model`, `Decal`, etc.) are mapped to the numeric AssetType IDs the endpoint expects.
 
-### 4. Script edit flow
+## Adding a tool
 
-Script editing is different from plain property/object tools:
-
-1. `set_script_source` or `patch_script` first reads the current script
-2. the server computes a structured diff using `diff-engine.ts`
-3. the diff is staged in the server queue
-4. the diff is also sent to the plugin using `stage_diff`
-5. the plugin renders a diff review UI
-6. the user can accept/reject whole files or individual hunks
-7. accepted hunks are applied back into the script
-
-This is the main "agentic engineering" loop in Linkedsword.
-
-## Modes And Safety Model
-
-The server config supports three modes:
-
-- `full`: all tools available
-- `inspector`: read-only tools only
-- `sandbox`: declared as experimental
-
-Important current behavior:
-
-- `inspector` is actually enforced in `bridge.ts`
-- `sandbox` is not implemented as a real shadow-copy execution system yet
-- diff-based script editing is the main safety layer for code changes
-- many instance/property operations rely on Studio undo via `ChangeHistoryService`
-
-## Tool Registry
-
-The source of truth for registered tools is the server code in `packages/server/src/tools`.
-
-### Navigation
-
-Defined in `packages/server/src/tools/navigation.ts`:
-
-- `get_file_tree`
-- `get_project_structure`
-- `get_place_info`
-- `get_services`
-- `list_roblox_studios`
-- `set_active_studio`
-
-Use these first when an LLM needs basic project context.
-
-### Search and inspection
-
-Defined in `packages/server/src/tools/search.ts`:
-
-- `search_files`
-- `search_objects`
-- `search_by_property`
-- `get_instance_properties`
-- `get_instance_children`
-- `get_class_info`
-- `get_selection`
-- `set_selection`
-- `grep_scripts`
-- `mass_get_property`
-- `get_descendants`
-
-These are mostly read-only discovery tools (except `set_selection`).
-
-### Script tools
-
-Defined in `packages/server/src/tools/script.ts`:
-
-- `get_script_source`
-- `set_script_source`
-- `patch_script`
-- `grep_replace`
-- `execute_luau`
-- `run_code`
-- `edit_script_lines`
-- `insert_script_lines`
-- `delete_script_lines`
-
-Notes:
-
-- `set_script_source` stages a diff unless auto-accept is enabled
-- `patch_script` requires a unique `oldText` match
-- `run_code` is an alias of `execute_luau`
-- `edit_script_lines`, `insert_script_lines`, `delete_script_lines` operate on line ranges and stage diffs
-
-### Instance tools
-
-Defined in `packages/server/src/tools/instance.ts`:
-
-- `create_object`
-- `delete_object`
-- `set_property`
-- `mass_create_objects`
-- `mass_set_property`
-- `mass_duplicate`
-- `smart_duplicate`
-- `set_calculated_property`
-- `clone_object`
-- `reparent_object`
-- `group_objects`
-- `ungroup_objects`
-- `batch_operations`
-
-These directly mutate the live DataModel through the plugin.
-
-### Playtest tools
-
-Defined in `packages/server/src/tools/playtest.ts`:
-
-- `start_playtest`
-- `stop_playtest`
-- `get_playtest_output`
-- `get_studio_mode`
-- `run_script_in_play_mode`
-- `user_mouse_input`
-- `user_keyboard_input`
-- `character_navigation`
-
-These are the most important tools to verify against current implementation before relying on them.
-
-### Diff, meta, attributes, tags, and build tools
-
-Defined in `packages/server/src/tools/diff-meta.ts`:
-
-- `get_diff_queue`
-- `resolve_diff`
-- `get_diff_history`
-- `get_activity_log`
-- `set_mode`
-- `rollback`
-- `redo`
-- `get_attribute`
-- `get_attributes`
-- `set_attribute`
-- `delete_attribute`
-- `get_tags`
-- `get_tagged`
-- `add_tag`
-- `remove_tag`
-- `capture_screenshot`
-- `export_build`
-- `import_build`
-- `list_library`
-- `insert_model`
-- `get_console_output`
-
-### Spatial tools
-
-Defined in `packages/server/src/tools/spatial.ts`:
-
-- `create_weld`
-- `get_bounding_box`
-- `raycast`
-- `fill_terrain`
-- `clear_terrain`
-
-## What The Plugin Actually Implements
-
-The plugin is the runtime truth for what Studio can really do today.
-
-Broad categories implemented inside `packages/plugin/src/plugin.luau` (~4700 lines):
-
-- Explorer/DataModel traversal (file tree, descendants, project structure)
-- property reads and writes (single, mass, calculated)
-- script reads and writes (full source, line-level edits, grep-replace)
-- staged diff rendering and resolution (GitHub-style hunk review UI)
-- diff history tracking (accepted/rejected outcomes)
-- direct Luau execution (`execute_luau` / `run_code`)
-- object creation/deletion/duplication/cloning/reparenting/grouping
-- batch operations (sequential multi-tool execution)
-- rollback and redo through Studio ChangeHistoryService
-- attribute and tag management (get/set/delete/add/remove)
-- selection control (get/set Explorer selection)
-- simple build library persistence via `plugin:GetSetting`
-- insert model by asset ID
-- spatial tools: raycast, bounding box, weld creation, terrain fill/clear
-- console output capture (print/warn/error logs)
-- playtest control (start/stop, mode detection)
-- mascot system with 3 skins (cat, robot, dog) and idle/active animations
-- activity feed with real-time tool call logging
-
-## Important Current Caveats
-
-This section documents known gaps between tool descriptions and actual implementation.
-
-### Port and local bridge
-
-- the default port in code is `3003`
-- `.mcp.json` points at `packages/server/dist/index.js`
-- some text in the public README still described `3002` before this doc was added
-
-### Playtest tooling is only partially real
-
-Current plugin handlers show:
-
-- `start_playtest` returns a success stub
-- `stop_playtest` returns a success stub
-- `get_playtest_output` returns an empty stub payload
-- `run_script_in_play_mode` currently just runs code immediately
-
-That means the server interface for playtest automation exists, but the Studio implementation is not yet a full playtest controller.
-
-### Virtual input is not available
-
-Current plugin behavior:
-
-- `user_mouse_input` returns an error saying virtual mouse input is unavailable
-- `user_keyboard_input` returns an error saying virtual keyboard input is unavailable
-
-### Screenshot capture is not available
-
-`capture_screenshot` currently returns an unavailable error from the plugin.
-
-### "Sandbox" mode is not implemented
-
-The mode exists in types, config, and tool descriptions, but there is no real sandbox execution path in the bridge or plugin.
-
-### Some tool descriptions are broader than the implementation
-
-Examples:
-
-- `get_instance_properties` returns a curated subset of properties, not every possible property
-- `get_class_info` builds a synthetic summary from a temporary instance, not a full Roblox API reference
-- `search_by_property` compares stringified property values
-
-### "Transaction-safe" batch ops are not fully transaction-safe yet
-
-The tool descriptions market some batch operations as atomic or rollback-safe.
-
-Current plugin behavior is best described as:
-
-- iterate
-- apply per item
-- collect errors
-- return partial success in many cases
-
-If true all-or-nothing semantics are required, they still need to be implemented.
-
-## LLM Operating Guide
-
-If you are using Linkedsword as an agentic engineering surface, the safest default workflow is:
-
-1. Discover structure with `get_project_structure` or `get_file_tree`
-2. Narrow down with `search_files`, `search_objects`, `grep_scripts`, and `get_script_source`
-3. Prefer `patch_script` for focused edits
-4. Use `set_script_source` for larger script rewrites
-5. Review pending diffs with `get_diff_queue`
-6. Use `resolve_diff` only when an automated accept/reject flow is truly intended
-7. Use `rollback` if the operation was wrong and Studio undo should revert it
-
-For inspection-only sessions:
-
-1. call `set_mode` with `inspector`
-2. avoid write tools entirely
-3. gather context with search/navigation tools first
-
-For broad one-off Studio queries:
-
-- prefer `run_code` / `execute_luau`
-- keep the code small and explicit
-- use `print()` for structured output
-
-## Local Config Surface
-
-### MCP config
-
-Copy `.mcp.json.example` to `.mcp.json` to register Linkedsword locally:
-
-- command: `node`
-- args: `packages/server/dist/index.js`
-
-This is the simplest local setup for Cursor/Claude-style MCP clients. The `.mcp.json` file is gitignored since it may contain absolute paths.
-
-### Claude permissions
-
-`.claude/settings.json` and `.claude/settings.local.json` whitelist a subset of Linkedsword tools and a few local shell/web operations.
-
-That means the repo already has some local agent-permission intent encoded outside the app code.
-
-## Extension Guide
-
-To add a new MCP tool cleanly:
-
-1. register the MCP tool in the correct file under `packages/server/src/tools`
-2. validate inputs with `zod`
-3. if it is a Studio-backed tool, send it through `bridge.sendToStudio`
-4. add a handler in `packages/plugin/src/plugin.luau`
-5. if it mutates scripts, decide whether it should use the staged diff flow
-6. update this doc and the public `README.md` if the tool changes the user-facing surface area
-
-If a tool is server-only, it can return directly without going through Studio.
-
-## Suggested Source-Of-Truth Order
-
-When docs and code disagree, trust them in this order:
-
-1. `packages/plugin/src/plugin.luau`
-2. `packages/server/src/services/bridge.ts`
-3. `packages/server/src/tools/*.ts`
-4. `README.md`
-
-The plugin is the final authority on what Roblox Studio can actually execute.
-
-## Quick File Reference
-
-- boot MCP server: `packages/server/src/index.ts`
-- bridge transport: `packages/server/src/services/bridge.ts`
-- diff logic: `packages/server/src/services/diff-engine.ts`
-- tool registration: `packages/server/src/tools`
-- Studio runtime truth: `packages/plugin/src/plugin.luau`
-- local MCP config: `.mcp.json` (from `.mcp.json.example`)
-- Claude permissions: `.claude/settings.json`
-
-## Why This Doc Exists
-
-Linkedsword is trying to be more than a raw tool list. It is trying to be a reliable engineering loop between:
-
-- an LLM
-- a local MCP server
-- a review-aware editing model
-- a live Roblox Studio runtime
-
-That only works well if the docs match the code. This file is the repo's single general-purpose reference for that connection.
+1. Register the tool in the appropriate `packages/server/src/tools/*.ts` file with a zod schema.
+2. If it needs Studio, route it through `bridge.sendToStudio(toolName, params)` and add a matching `handlers[toolName]` in `plugin.luau`. Otherwise resolve it server-side (e.g. plan engine).
+3. If it's read-only, add the tool name to `isReadOnlyTool` in `bridge.ts` so inspector mode allows it, and to `READ_ONLY_TOOLS` in `plugin.luau` so the inspector build allows it.
+4. Plugin handlers must nil-guard their params on line 1, wrap mutations in `ChangeHistoryService:SetWaypoint("LS:<verb>")` before and after, and return `{success, data?}` or `{success = false, error}`.
+5. Build the server (`npx tsup ...`), rebuild the plugin (`node packages/plugin/build-rbxmx.js`), redeploy it, and reload the MCP client to pick up the new schema.
+
+## Tool registry
+
+Source of truth is the code. The current set:
+
+| Category | File | Tools |
+|---|---|---|
+| Navigation | `tools/navigation.ts` | `get_file_tree`, `get_project_structure`, `get_place_info`, `get_services`, `list_roblox_studios`, `set_active_studio` |
+| Search | `tools/search.ts` | `search_files`, `search_objects`, `search_by_property`, `get_instance_properties`, `get_instance_children`, `get_class_info`, `get_selection`, `set_selection`, `grep_scripts`, `mass_get_property`, `get_descendants`, `get_stable_id`, `resolve_stable_id`, `compare_instances`, `get_connected_instances`, `parallel_search` |
+| Script | `tools/script.ts` | `get_script_source`, `set_script_source`, `patch_script`, `grep_replace`, `execute_luau`, `run_code`, `edit_script_lines`, `insert_script_lines`, `delete_script_lines` |
+| Instance | `tools/instance.ts` | `create_object`, `delete_object`, `set_property`, `mass_create_objects`, `mass_set_property`, `mass_duplicate`, `smart_duplicate`, `set_calculated_property`, `clone_object`, `reparent_object`, `group_objects`, `ungroup_objects`, `batch_operations` |
+| Playtest | `tools/playtest.ts` | `start_playtest`, `stop_playtest`, `get_playtest_output`, `get_studio_mode`, `run_script_in_play_mode`, `user_mouse_input`, `user_keyboard_input`, `character_navigation`, `run_playtest_scenario` |
+| Spatial | `tools/spatial.ts` | `create_weld`, `get_bounding_box`, `raycast`, `fill_terrain`, `clear_terrain` |
+| Assets | `tools/assets.ts` | `upload_asset`, `search_assets`, `get_asset_details`, `get_asset_thumbnail` |
+| Plans | `tools/plan.ts` | `create_plan`, `get_plan`, `list_plans`, `update_plan_step`, `delete_plan`, `snapshot_checkpoint`, `revert_to_checkpoint`, `delete_checkpoint` |
+| Diff/meta | `tools/diff-meta.ts` | `get_diff_queue`, `resolve_diff`, `get_diff_history`, `get_activity_log`, `set_mode`, `set_auto_accept`, `get_auto_accept_status`, `rollback`, `redo`, `get_attribute`, `get_attributes`, `set_attribute`, `delete_attribute`, `get_tags`, `get_tagged`, `add_tag`, `remove_tag`, `capture_screenshot`, `export_build`, `import_build`, `list_library`, `insert_model`, `get_console_output` |
+
+93 tools total.
+
+## Known limitations
+
+- **Pixel screenshots.** Plugin sandbox doesn't expose viewport pixels; `capture_screenshot` returns camera metadata only.
+- **Heartbeat drops.** Rapid parallel calls can drop the long-poll connection. `parallel_search` internally batches 3-at-a-time for that reason; if you're firing N tools by hand, cap at 3 concurrent.
+- **MCP server restart.** A schema change requires reloading the MCP client window — the harness reads tool definitions on connect.
+- **Procedural Models.** Roblox shipped the `ProceduralModel` instance type in April 2026. A spike confirmed it's plugin-accessible, but `generate_procedural_model` isn't built yet.
+- **`get_instance_properties`** returns a curated subset, not every property the instance exposes.
+- **`search_by_property`** compares stringified values, so floats and exotic types may not match exactly.
+
+## Source of truth
+
+When docs and code disagree, the code wins. In order:
+
+1. `packages/plugin/src/plugin.luau` — what Roblox Studio can actually do.
+2. `packages/server/src/services/bridge.ts` — how requests flow.
+3. `packages/server/src/tools/*.ts` — the tool surface.
+4. This file, then the public README.

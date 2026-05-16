@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ============================================================================
-// Linkedsword MCP Server — Main Entry Point
-// Agentic Roblox Studio integration with script diffs, bulk ops, and a cat.
+// Linkedsword MCP server entry point.
+// Boots the MCP stdio transport and the local HTTP bridge.
 // ============================================================================
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

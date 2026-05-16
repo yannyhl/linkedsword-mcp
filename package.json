@@ -2,7 +2,7 @@
   "name": "linkedsword",
   "version": "0.1.0",
   "private": true,
-  "description": "Agentic Roblox Studio MCP — script diffs, bulk ops, playtest automation, and a cat that sleeps.",
+  "description": "Roblox Studio MCP server and plugin with diff-reviewed script editing, planning mode, and playtest automation.",
   "workspaces": [
     "packages/server"
   ],
@@ -12,7 +12,6 @@
     "start": "npm run start --workspace=packages/server",
     "lint": "npm run lint --workspace=packages/server"
   },
-  "keywords": ["mcp", "roblox", "roblox-studio", "claude", "ai", "agentic"],
-  "license": "MIT",
-  "author": "Linkedsword Contributors"
+  "keywords": ["mcp", "roblox", "roblox-studio"],
+  "license": "MIT"
 }

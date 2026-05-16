@@ -28,7 +28,7 @@ The numberedSource field has "N: code" format for accurate line identification.`
     description: `Write new source code to a script. The change is NOT applied immediately — it is staged
 as a diff in the review queue. The user can accept or reject individual hunks in the Linkedsword plugin.
 
-If auto-accept is enabled (for unattended agentic loops), changes apply immediately.
+If auto-accept is enabled, changes apply immediately without staging.
 
 Args:
   - path (string): Script path

@@ -1,7 +1,7 @@
 {
   "name": "linkedsword-mcp-server",
   "version": "0.5.0",
-  "description": "Linkedsword MCP server — agentic Roblox Studio integration with script diffs, bulk ops, and playtest automation",
+  "description": "Roblox Studio MCP server: diff-reviewed script editing, planning mode, playtest automation, asset uploads.",
   "main": "dist/index.js",
   "bin": {
     "linkedsword-mcp": "dist/index.js"

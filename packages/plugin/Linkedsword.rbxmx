@@ -5,15 +5,10 @@
 		<Properties>
 			<string name="Name">Linkedsword</string>
 			<ProtectedString name="Source"><![CDATA[--[[
-	Linkedsword — Roblox Studio MCP Plugin
-	Agentic AI bridge with script diff review, activity feed, and a sleeping cat.
+	Linkedsword — Roblox Studio MCP plugin.
 
-	Architecture:
-	  1. HTTP long-poll loop connects to the Linkedsword MCP server
-	  2. Incoming tool requests are routed to handler modules
-	  3. Script diffs are staged in a pop-out window for visual review
-	  4. Mascot animation reflects connection state
-	  5. Settings page for theme/behavior customization
+	Long-polls the local MCP server, dispatches tool calls against the live
+	DataModel, and stages script edits as reviewable diffs.
 ]]
 
 -- Services
