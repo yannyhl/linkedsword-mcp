@@ -1,17 +1,25 @@
 {
-  "name": "linkedsword-mcp-server",
+  "name": "linkedsword-mcp",
   "version": "0.5.0",
   "description": "Roblox Studio MCP server: diff-reviewed script editing, planning mode, playtest automation, asset uploads.",
   "main": "dist/index.js",
   "bin": {
     "linkedsword-mcp": "dist/index.js"
   },
+  "files": [
+    "dist/",
+    "plugin/Linkedsword.rbxmx",
+    "plugin/LinkedswordInspector.rbxmx",
+    "scripts/install-plugin.js",
+    "README.md"
+  ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs --dts --clean",
+    "build": "tsup src/index.ts --format cjs --clean",
     "dev": "tsup src/index.ts --format cjs --watch --onSuccess 'node dist/index.js'",
     "start": "node dist/index.js",
     "lint": "tsc --noEmit",
-    "install-plugin": "node scripts/install-plugin.js"
+    "install-plugin": "node scripts/install-plugin.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -28,9 +36,16 @@
     "tsup": "^8.3.0",
     "typescript": "^5.7.0"
   },
-  "keywords": ["mcp", "roblox", "roblox-studio", "linkedsword"],
+  "keywords": ["mcp", "roblox", "roblox-studio"],
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yannyhl/linkedsword-mcp.git",
+    "directory": "packages/server"
+  },
+  "homepage": "https://github.com/yannyhl/linkedsword-mcp#readme",
+  "bugs": "https://github.com/yannyhl/linkedsword-mcp/issues"
 }

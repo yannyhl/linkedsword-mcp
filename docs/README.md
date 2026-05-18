@@ -106,7 +106,7 @@ Verdicts: `pass`, `fail`, `inconclusive` (max duration hit or loop detected), `e
 
 ## Assets
 
-`packages/server/src/tools/assets.ts` handles uploads via Open Cloud (`https://apis.roblox.com/assets/v1/assets`) or the legacy publish endpoint with a `ROBLOSECURITY` cookie (Decal only). Credentials live in `~/.linkedsword/auth.json` loaded by `services/auth.ts`; `npx linkedsword-mcp-server auth set` writes the file at mode `0600`.
+`packages/server/src/tools/assets.ts` handles uploads via Open Cloud (`https://apis.roblox.com/assets/v1/assets`) or the legacy publish endpoint with a `ROBLOSECURITY` cookie (Decal only). Credentials live in `~/.linkedsword/auth.json` loaded by `services/auth.ts`; `npx linkedsword-mcp auth set` writes the file at mode `0600`.
 
 Creator Store search (`search_assets`, `get_asset_details`, `get_asset_thumbnail`) hits public catalog endpoints — no auth needed. The catalog API only accepts `Limit ∈ {10, 28, 30, 60, 120}`, so the tool clamps the requested limit up to the next allowed value, and string asset names (`Model`, `Decal`, etc.) are mapped to the numeric AssetType IDs the endpoint expects.
 

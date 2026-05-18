@@ -56,7 +56,7 @@ async function fileExists(p: string): Promise<boolean> {
 function serverEntry(): Record<string, unknown> {
   return {
     command: "npx",
-    args: ["-y", "linkedsword-mcp-server"],
+    args: ["-y", "linkedsword-mcp"],
   };
 }
 
@@ -101,17 +101,28 @@ async function prompt(question: string): Promise<string> {
   return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
 }
 
-async function installPluginRbxmx(): Promise<void> {
-  // Copy the bundled .rbxmx into ~/Documents/Roblox/Plugins/.
-  // Resolve from the running binary location so it works after `npx`.
-  const candidate = join(__dirname, "..", "..", "plugin", "Linkedsword.rbxmx");
-  if (!(await fileExists(candidate))) {
-    console.error(`Plugin .rbxmx not found at ${candidate}. Run \`node packages/plugin/build-rbxmx.js\` first.`);
+async function installPluginRbxmx(variant: "standard" | "inspector" = "standard"): Promise<void> {
+  // Look in two locations: the bundled `plugin/` folder shipped inside the npm
+  // tarball (relative to dist/), and the dev-clone path (relative to
+  // packages/server/, two levels up). First hit wins.
+  const filename = variant === "inspector" ? "LinkedswordInspector.rbxmx" : "Linkedsword.rbxmx";
+  const candidates = [
+    join(__dirname, "..", "plugin", filename),                  // npm: dist/../plugin/
+    join(__dirname, "..", "..", "..", "plugin", filename),      // dev clone: packages/server/src/../../../plugin/
+  ];
+  let source: string | null = null;
+  for (const c of candidates) {
+    if (await fileExists(c)) { source = c; break; }
+  }
+  if (!source) {
+    console.error(`Plugin .rbxmx not found. Searched:`);
+    for (const c of candidates) console.error(`  ${c}`);
+    console.error(`If running from a dev clone, build it first: \`node packages/plugin/build-rbxmx.js${variant === "inspector" ? " --inspector" : ""}\`.`);
     return;
   }
-  const dst = join(HOME, "Documents", "Roblox", "Plugins", "Linkedsword.rbxmx");
+  const dst = join(HOME, "Documents", "Roblox", "Plugins", filename);
   await fs.mkdir(dirname(dst), { recursive: true });
-  await fs.copyFile(candidate, dst);
+  await fs.copyFile(source, dst);
   console.log(`Installed plugin → ${dst}`);
 }
 
@@ -119,6 +130,7 @@ async function runInstall(args: string[]): Promise<void> {
   const yes = args.includes("--yes") || args.includes("-y");
   const clientArg = args.find((a) => a.startsWith("--client="))?.split("=")[1];
   const alsoPlugin = args.includes("--plugin");
+  const inspectorVariant = args.includes("--inspector");
 
   const targets = clientCandidates();
   for (const t of targets) t.detected = await fileExists(t.configPath) || dirname(t.configPath).endsWith(t.name);
@@ -149,7 +161,7 @@ async function runInstall(args: string[]): Promise<void> {
   }
 
   if (alsoPlugin) {
-    await installPluginRbxmx();
+    await installPluginRbxmx(inspectorVariant ? "inspector" : "standard");
   }
 
   console.log("\nDone. Reload the affected client(s) to pick up the new server.");
@@ -202,7 +214,10 @@ export async function runCli(argv: string[]): Promise<boolean> {
   if (cmd === "auth")    { await runAuth(rest); return true; }
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
     console.log("linkedsword commands:");
-    console.log("  install [--client=<name>] [--yes] [--plugin]   Quick Connect for supported clients");
+    console.log("  install [--client=<name>] [--yes] [--plugin] [--inspector]");
+    console.log("      Quick Connect for supported MCP clients. --plugin also copies the");
+    console.log("      Studio .rbxmx into your local plugins folder; pair with --inspector");
+    console.log("      to install the read-only build.");
     console.log("  auth set --api-key=... | --cookie=...           Write ~/.linkedsword/auth.json");
     console.log("  auth show                                        Print the auth file (masked)");
     return true;

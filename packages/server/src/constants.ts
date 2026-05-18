@@ -10,7 +10,7 @@ export const MAX_RESPONSE_CHARS = 100_000;
 export const MAX_ITERATIONS = 25;
 
 export const VERSION = "0.5.0";
-export const SERVER_NAME = "linkedsword-mcp-server";
+export const SERVER_NAME = "linkedsword-mcp";
 export const MAX_DIFF_QUEUE_SIZE = 50;
 export const MAX_DIFF_HISTORY_SIZE = 200;
 export const DIFF_CONTEXT_LINES = 3;
