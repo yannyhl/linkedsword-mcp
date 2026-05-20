@@ -26,6 +26,24 @@ import {
   VERSION,
 } from "../constants.js";
 
+// Whitelist of read-only tool names. Used both at runtime (inspector-mode write
+// rejection) and at registration time (inspector mode skips registering anything
+// not in this set, so the manifest sent to the client is smaller).
+export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "get_file_tree", "search_files", "get_place_info", "get_services",
+  "search_objects", "get_instance_properties", "get_instance_children",
+  "search_by_property", "get_class_info", "get_project_structure",
+  "mass_get_property", "get_script_source", "grep_scripts",
+  "get_attribute", "get_attributes", "get_tags", "get_tagged",
+  "get_selection", "get_playtest_output", "get_studio_mode",
+  "list_roblox_studios", "get_diff_queue", "get_activity_log",
+  "get_diff_history", "capture_screenshot", "get_bounding_box",
+  "get_descendants", "get_console_output", "raycast",
+  "resolve_stable_id", "compare_instances", "get_connected_instances",
+  "parallel_search", "get_auto_accept_status",
+  "search_assets", "get_asset_details", "get_asset_thumbnail",
+]);
+
 export class HttpBridge {
   private app: express.Application;
   private pendingRequests: Map<string, PendingRequest> = new Map();
@@ -74,6 +92,29 @@ export class HttpBridge {
 
     // Plugin posts diff resolutions
     this.app.post("/diff/resolve", (req, res) => this.handleDiffResolve(req, res));
+
+    // Plugin reads + writes the auto-accept budget. Lets the user toggle from
+    // the plugin UI without having to call the MCP set_auto_accept tool.
+    this.app.get("/config/auto-accept", (_req, res) => {
+      res.json(this.getAutoAcceptBudget());
+    });
+    this.app.post("/config/auto-accept", (req, res) => {
+      const { scope, count } = req.body as { scope?: string; count?: number };
+      if (scope !== "off" && scope !== "session" && scope !== "next_n") {
+        res.status(400).json({ error: "scope must be 'off' | 'session' | 'next_n'" });
+        return;
+      }
+      // Mirror the zod constraints on the MCP set_auto_accept tool so the
+      // two entry points behave identically (int 1..50 when next_n).
+      if (scope === "next_n") {
+        if (typeof count !== "number" || !Number.isInteger(count) || count < 1 || count > 50) {
+          res.status(400).json({ error: "count must be an integer in 1..50 when scope is 'next_n'" });
+          return;
+        }
+      }
+      const budget = this.setAutoAcceptBudget(scope, count);
+      res.json(budget);
+    });
 
     // Health check
     this.app.get("/health", (_req, res) => {
@@ -265,6 +306,16 @@ export class HttpBridge {
     if (Date.now() - instance.lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
       this.studioInstances.delete(instanceId);
       this.activeInstanceId = null;
+      // Resolve any parked long-poll for the dead instance so it doesn't sit
+      // until its 25s timeout — the plugin reconnect path will re-park.
+      // Wrap each resolve so a thrown res.json (e.g., socket already half-
+      // closed) doesn't abort the filter and leak the rest of the waiters.
+      this.pollWaiters = this.pollWaiters.filter((w) => {
+        if (w.instanceId !== instanceId) return true;
+        clearTimeout(w.timer);
+        try { w.resolve(null); } catch { /* socket already gone */ }
+        return false;
+      });
       return { success: false, error: "Studio instance heartbeat timed out. Restart the plugin." };
     }
 
@@ -457,23 +508,8 @@ export class HttpBridge {
     return undefined;
   }
 
-  private isReadOnlyTool(tool: string): boolean {
-    const readOnlyTools = new Set([
-      "get_file_tree", "search_files", "get_place_info", "get_services",
-      "search_objects", "get_instance_properties", "get_instance_children",
-      "search_by_property", "get_class_info", "get_project_structure",
-      "mass_get_property", "get_script_source", "grep_scripts",
-      "get_attribute", "get_attributes", "get_tags", "get_tagged",
-      "get_selection", "get_playtest_output", "get_studio_mode",
-      "list_roblox_studios", "get_diff_queue", "get_activity_log",
-      "get_diff_history", "capture_screenshot", "get_bounding_box",
-      "get_descendants", "get_console_output", "raycast",
-      // Phase 1+2 parity additions
-      "resolve_stable_id", "compare_instances", "get_connected_instances",
-      "parallel_search", "get_auto_accept_status",
-      "search_assets", "get_asset_details", "get_asset_thumbnail",
-    ]);
-    return readOnlyTools.has(tool);
+  public isReadOnlyTool(tool: string): boolean {
+    return READ_ONLY_TOOL_NAMES.has(tool);
   }
 
   private logActivity(
