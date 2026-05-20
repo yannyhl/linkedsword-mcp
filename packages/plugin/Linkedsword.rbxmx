@@ -26,7 +26,7 @@ local LogService = game:GetService("LogService")
 local PathfindingService = game:GetService("PathfindingService")
 
 -- Constants
-local PLUGIN_VERSION = "0.6.0"
+local PLUGIN_VERSION = "0.6.1"
 local DEFAULT_PORT = 3003
 local HEARTBEAT_INTERVAL = 5
 local POLL_TIMEOUT = 30
@@ -51,6 +51,8 @@ local READ_ONLY_TOOLS = {
 	get_descendants = true, get_console_output = true, raycast = true,
 	resolve_stable_id = true, compare_instances = true, get_connected_instances = true,
 	get_auto_accept_status = true,
+	parallel_search = true,
+	search_assets = true, get_asset_details = true, get_asset_thumbnail = true,
 }
 
 -- Default theme (shadcn/zinc-inspired palette)
@@ -133,12 +135,39 @@ end)
 -- Load saved settings
 local theme = plugin:GetSetting("LSTheme") or DEFAULT_THEME
 local settings = plugin:GetSetting("LSSettings") or {
-	autoAccept = false,
 	maxFeedEntries = 100,
 	showMascot = true,
 	mascotSkin = "cat",
 }
 if not settings.mascotSkin then settings.mascotSkin = "cat" end
+-- Previously the plugin owned an `autoAccept` toggle locally; auto-accept is
+-- now server-authoritative. Drop the stale field so it can't mislead later.
+settings.autoAccept = nil
+
+-- Forward-declared so the segmented-control closure and the heartbeat poller
+-- can both refer to them before they're assigned.
+local autoAcceptSegmented = nil :: any
+local aaIndicatorLabel: TextLabel? = nil
+local function updateAutoAcceptIndicator(budget: any)
+	local idx = 1
+	local labelText = "AA: Off"
+	if budget then
+		if budget.mode == "session" then
+			idx = 2
+			labelText = "AA: Session"
+		elseif budget.mode == "next_n" and (budget.remaining or 0) > 0 then
+			idx = 3
+			labelText = "AA: " .. tostring(budget.remaining)
+		end
+	end
+	if aaIndicatorLabel then
+		aaIndicatorLabel.Text = labelText
+		aaIndicatorLabel.TextColor3 = if idx == 1 then rgbFromTable(theme.textSecondary) else rgbFromTable(theme.success)
+	end
+	if autoAcceptSegmented and autoAcceptSegmented.setActive then
+		autoAcceptSegmented.setActive(idx)
+	end
+end
 
 -- Ensure theme has all keys (in case new ones were added); deep-copy to avoid mutating DEFAULT_THEME
 for k, v in DEFAULT_THEME do
@@ -1698,6 +1727,10 @@ local function httpPost(path: string, body: any): (boolean, any)
 	return false, result
 end
 
+-- Older diff payloads emitted shared context lines as both the trailing ctx
+-- of hunk N and the leading ctx of hunk N+1. The engine now dedups, but any
+-- diff staged before the upgrade still has duplicates queued. Skip a ctx
+-- entry when we've already advanced past the line it claims to describe.
 local function applyPartialDiff(diffData)
 	local inst = resolveInstance(diffData.scriptPath)
 	if not inst or not inst:IsA("LuaSourceContainer") then return nil end
@@ -1712,11 +1745,17 @@ local function applyPartialDiff(diffData)
 		end
 		if hunk.status == "accepted" then
 			for _, line in hunk.lines do
+				if line.type == "ctx" and line.lineOld and oldIdx > line.lineOld then
+					continue
+				end
 				if line.type == "add" or line.type == "ctx" then table.insert(result, line.content) end
 				if line.type == "del" or line.type == "ctx" then oldIdx += 1 end
 			end
 		else
 			for _, line in hunk.lines do
+				if line.type == "ctx" and line.lineOld and oldIdx > line.lineOld then
+					continue
+				end
 				if line.type == "del" or line.type == "ctx" then
 					table.insert(result, oldLines[oldIdx])
 					oldIdx += 1
@@ -1744,6 +1783,9 @@ local function reconstructNewSource(diffData)
 			oldIdx += 1
 		end
 		for _, line in hunk.lines do
+			if line.type == "ctx" and line.lineOld and oldIdx > line.lineOld then
+				continue
+			end
 			if line.type == "add" or line.type == "ctx" then table.insert(result, line.content) end
 			if line.type == "del" or line.type == "ctx" then oldIdx += 1 end
 		end
@@ -2109,6 +2151,17 @@ versionLabel.TextSize = 11
 versionLabel.Font = Enum.Font.GothamMedium
 versionLabel.TextXAlignment = Enum.TextXAlignment.Left
 versionLabel.Parent = header
+
+aaIndicatorLabel = Instance.new("TextLabel")
+aaIndicatorLabel.Name = "AutoAcceptStatus"
+aaIndicatorLabel.Size = UDim2.new(0, 76, 1, 0)
+aaIndicatorLabel.BackgroundTransparency = 1
+aaIndicatorLabel.Text = "AA: Off"
+aaIndicatorLabel.TextColor3 = rgbFromTable(theme.textSecondary)
+aaIndicatorLabel.TextSize = 10
+aaIndicatorLabel.Font = Enum.Font.Code
+aaIndicatorLabel.TextXAlignment = Enum.TextXAlignment.Left
+aaIndicatorLabel.Parent = header
 
 local settingsBtn = Instance.new("TextButton")
 settingsBtn.Name = "SettingsBtn"
@@ -2583,6 +2636,81 @@ local function createColorSetting(name: string, label: string, themeKey: string,
 	table.insert(colorSettingRefreshers, refresh)
 end
 
+-- Three-state segmented control. Returns { setActive = function(idx) end } so an
+-- async poll can sync the visual state to whatever the server reports.
+local function createSegmentedSetting(name: string, label: string, options: { string }, defaultIdx: number, order: number, onChange: (number) -> ())
+	local row = Instance.new("Frame")
+	row.Name = name
+	row.Size = UDim2.new(1, 0, 0, 48)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = order
+	row.Parent = settingsSection
+
+	local rowLabel = Instance.new("TextLabel")
+	rowLabel.Size = UDim2.new(1, 0, 0, 16)
+	rowLabel.BackgroundTransparency = 1
+	rowLabel.Text = label
+	rowLabel.TextColor3 = rgbFromTable(theme.textPrimary)
+	rowLabel.TextSize = 11
+	rowLabel.Font = Enum.Font.GothamMedium
+	rowLabel.TextXAlignment = Enum.TextXAlignment.Left
+	rowLabel.Parent = row
+
+	local segRow = Instance.new("Frame")
+	segRow.Size = UDim2.new(1, 0, 0, 24)
+	segRow.Position = UDim2.new(0, 0, 0, 20)
+	segRow.BackgroundColor3 = Color3.fromRGB(28, 32, 38)
+	segRow.BorderSizePixel = 0
+	segRow.Parent = row
+	Instance.new("UICorner", segRow).CornerRadius = UDim.new(0, 6)
+
+	local segLayout = Instance.new("UIListLayout")
+	segLayout.FillDirection = Enum.FillDirection.Horizontal
+	segLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	segLayout.Padding = UDim.new(0, 0)
+	segLayout.Parent = segRow
+
+	local segWidth = 1 / #options
+	local buttons = {}
+	local activeIdx = defaultIdx
+
+	local function refreshVisuals()
+		for i, btn in buttons do
+			btn.BackgroundColor3 = if i == activeIdx then rgbFromTable(theme.accent) else Color3.fromRGB(28, 32, 38)
+			btn.TextColor3 = if i == activeIdx then Color3.fromRGB(255, 255, 255) else rgbFromTable(theme.textSecondary)
+		end
+	end
+
+	for i, opt in options do
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(segWidth, 0, 1, 0)
+		btn.LayoutOrder = i
+		btn.BackgroundColor3 = Color3.fromRGB(28, 32, 38)
+		btn.TextColor3 = rgbFromTable(theme.textSecondary)
+		btn.Text = opt
+		btn.TextSize = 10
+		btn.Font = Enum.Font.GothamBold
+		btn.BorderSizePixel = 0
+		btn.Parent = segRow
+		Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+		buttons[i] = btn
+
+		btn.Activated:Connect(function()
+			activeIdx = i
+			refreshVisuals()
+			onChange(i)
+		end)
+	end
+	refreshVisuals()
+
+	return {
+		setActive = function(idx: number)
+			activeIdx = idx
+			refreshVisuals()
+		end,
+	}
+end
+
 -- Helper to create a section header in settings
 local function createSectionHeader(text: string, order: number)
 	local lbl = Instance.new("TextLabel")
@@ -2680,11 +2808,35 @@ createToggleSetting("ShowMascot", "Show mascot", settings.showMascot, 1, functio
 	pcall(function() plugin:SetSetting("LSSettings", settings) end)
 end)
 
-createToggleSetting("AutoAccept", "Auto-accept diffs", settings.autoAccept, 2, function(val)
-	settings.autoAccept = val
-	pcall(function() plugin:SetSetting("LSSettings", settings) end)
-	showToast("Auto-accept " .. (if val then "enabled" else "disabled"), "info")
-end)
+-- Auto-accept budget: posts to the server (the only authority on accept routing).
+-- The segmented control reflects the live server state via a periodic poll, so
+-- changes made through the MCP set_auto_accept tool also update the UI.
+local AA_OPTIONS = { "Off", "Session", "Next 5" }
+local function aaScopeFromIdx(idx: number)
+	if idx == 2 then return "session", nil end
+	if idx == 3 then return "next_n", 5 end
+	return "off", nil
+end
+local function aaIdxFromBudget(budget: any)
+	if not budget then return 1 end
+	if budget.mode == "session" then return 2 end
+	if budget.mode == "next_n" and (budget.remaining or 0) > 0 then return 3 end
+	return 1
+end
+
+autoAcceptSegmented = createSegmentedSetting(
+	"AutoAccept", "Auto-accept diffs (server-side budget)", AA_OPTIONS, 1, 2,
+	function(idx)
+		local scope, count = aaScopeFromIdx(idx)
+		local ok, resp = httpPost("/config/auto-accept", { scope = scope, count = count })
+		if ok then
+			showToast("Auto-accept: " .. AA_OPTIONS[idx], "info")
+			updateAutoAcceptIndicator(resp)
+		else
+			showToast("Auto-accept change failed (server unreachable)", "error")
+		end
+	end
+)
 
 createDropdownSetting("MascotSkin", "Mascot skin", { "cat", "robot", "dog" }, settings.mascotSkin or "cat", 3, function(val)
 	settings.mascotSkin = val
@@ -3269,7 +3421,12 @@ local function renderHistoryDetail(entry)
 				hunkLabel.Size = UDim2.new(1, -80, 1, 0)
 				hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
 				hunkLabel.BackgroundTransparency = 1
-				hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld or 0, (hunk.startOld or 0) + #hunk.lines)
+				local oldSpan = 0
+				for _, l in hunk.lines do
+					if l.type == "del" or l.type == "ctx" then oldSpan += 1 end
+				end
+				local rangeEnd = (hunk.startOld or 0) + math.max(0, oldSpan - 1)
+				hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld or 0, rangeEnd)
 				hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
 				hunkLabel.TextSize = 12
 				hunkLabel.Font = Enum.Font.Code
@@ -3523,6 +3680,12 @@ renderHistoryUI = function()
 end
 
 local renderDiffUI -- forward declaration (used by switchToDiffView below)
+local rerenderPanel -- per-panel re-render (used by per-hunk accept/reject)
+local panelCollapsed = {} -- diffId -> bool; survives re-render so collapse state sticks
+local activePanels = {} -- diffId -> ScriptPanel Frame; lets rerenderPanel find its target
+
+local PANEL_MAX_HEIGHT = 480 -- per-script panel hard cap; long files scroll internally
+local PANEL_HEADER_HEIGHT = 36
 
 local function switchToDiffView(mode)
 	diffViewMode = mode
@@ -3532,6 +3695,14 @@ local function switchToDiffView(mode)
 	historyTab.BackgroundColor3 = if mode == "history" then DIFF_BG else DIFF_HEADER_BG
 	historyTab.TextColor3 = if mode == "history" then Color3.fromRGB(201, 209, 217) else GUTTER_TEXT
 	tabIndicator.Position = if mode == "pending" then UDim2.new(0, 0, 1, -2) else UDim2.new(0.5, 0, 1, -2)
+
+	-- Leaving pending mode destroys all ScriptPanel Frames via clearDiffScroll.
+	-- Drop the activePanels map so rerenderPanel can't later hit destroyed
+	-- Instances. Collapse state is intentionally kept so the user's expand/
+	-- collapse choices survive a tab toggle.
+	if mode ~= "pending" then
+		activePanels = {}
+	end
 
 	if mode == "pending" then
 		renderDiffUI()
@@ -3543,19 +3714,409 @@ end
 pendingTab.Activated:Connect(function() switchToDiffView("pending") end)
 historyTab.Activated:Connect(function() switchToDiffView("history") end)
 
-renderDiffUI = function()
-	if diffViewMode ~= "pending" then return end
+local function renderPanelBody(panel, hunkScroll, diffId, diffData, onChange, shouldScroll)
+	-- Wipe previous body
+	for _, child in hunkScroll:GetChildren() do
+		if not child:IsA("UIListLayout") then child:Destroy() end
+	end
 
-	-- Clear everything except layout and empty label
-	clearDiffScroll()
+	local lineOrder = 0
+	local firstChangePixelOffset = nil
+	local pixelOffset = 0
 
-	local globalFirstChangeOffset = nil
-	local globalPixelOffset = 0
-	local sectionOrder = 0
-	for diffId, diffData in diffQueue do
-		sectionOrder += 1
+	local displayLines
+	if diffData.oldSource then
+		local fullLines = buildFullScriptLines(diffData.oldSource, diffData.hunks)
+		displayLines = collapseFullScriptLines(fullLines, expandedRegions)
+	else
+		displayLines = {}
+		for hunkIdx, hunk in diffData.hunks do
+			table.insert(displayLines, { isHunkBoundary = true, hunkIdx = hunkIdx })
+			for _, line in hunk.lines do
+				table.insert(displayLines, {
+					type = line.type,
+					lineOld = line.lineOld,
+					lineNew = line.lineNew,
+					content = line.content,
+					hunkIdx = hunkIdx,
+				})
+			end
+		end
+	end
 
-		-- Count stats
+	for _, entry in displayLines do
+		if entry.isHunkBoundary then
+			local hunkIdx = entry.hunkIdx
+			local hunk = diffData.hunks[hunkIdx]
+			lineOrder += 1
+
+			-- Compute the old-line range from the lines that actually consume oldLines.
+			local oldSpan = 0
+			for _, l in hunk.lines do
+				if l.type == "del" or l.type == "ctx" then oldSpan += 1 end
+			end
+			local rangeEnd = hunk.startOld + math.max(0, oldSpan - 1)
+
+			local hunkSep = Instance.new("Frame")
+			hunkSep.Name = "HunkSep_" .. hunkIdx
+			hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+			hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
+			hunkSep.BorderSizePixel = 0
+			hunkSep.LayoutOrder = lineOrder
+			hunkSep.Parent = hunkScroll
+
+			local hunkLabel = Instance.new("TextLabel")
+			hunkLabel.Size = UDim2.new(1, -80, 1, 0)
+			hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
+			hunkLabel.BackgroundTransparency = 1
+			hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld, rangeEnd)
+			hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
+			hunkLabel.TextSize = 12
+			hunkLabel.Font = Enum.Font.Code
+			hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
+			hunkLabel.Parent = hunkSep
+
+			if hunk.status == "pending" then
+				local hAccBtn = Instance.new("TextButton")
+				hAccBtn.Size = UDim2.new(0, 20, 0, 18)
+				hAccBtn.Position = UDim2.new(1, -48, 0.5, -9)
+				hAccBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
+				hAccBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+				hAccBtn.Text = "✓"
+				hAccBtn.TextSize = 11
+				hAccBtn.Font = Enum.Font.GothamBold
+				hAccBtn.BorderSizePixel = 0
+				hAccBtn.Parent = hunkSep
+				Instance.new("UICorner", hAccBtn).CornerRadius = UDim.new(0, 4)
+
+				local hRejBtn = Instance.new("TextButton")
+				hRejBtn.Size = UDim2.new(0, 20, 0, 18)
+				hRejBtn.Position = UDim2.new(1, -24, 0.5, -9)
+				hRejBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
+				hRejBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+				hRejBtn.Text = "✗"
+				hRejBtn.TextSize = 11
+				hRejBtn.Font = Enum.Font.GothamBold
+				hRejBtn.BorderSizePixel = 0
+				hRejBtn.Parent = hunkSep
+				Instance.new("UICorner", hRejBtn).CornerRadius = UDim.new(0, 4)
+
+				local capturedDiffId = diffId
+				local capturedHunkId = hunk.id
+
+				hAccBtn.Activated:Connect(function()
+					httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "accept" })
+					hunk.status = "accepted"
+					onChange()
+				end)
+				hRejBtn.Activated:Connect(function()
+					httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "reject" })
+					hunk.status = "rejected"
+					onChange()
+				end)
+			elseif hunk.status == "accepted" then
+				local badge = Instance.new("TextLabel")
+				badge.Size = UDim2.new(0, 60, 0, 18)
+				badge.Position = UDim2.new(1, -66, 0.5, -9)
+				badge.BackgroundTransparency = 1
+				badge.Text = "✓ Accepted"
+				badge.TextColor3 = ADD_TEXT
+				badge.TextSize = 10
+				badge.Font = Enum.Font.GothamBold
+				badge.Parent = hunkSep
+			elseif hunk.status == "rejected" then
+				local badge = Instance.new("TextLabel")
+				badge.Size = UDim2.new(0, 60, 0, 18)
+				badge.Position = UDim2.new(1, -66, 0.5, -9)
+				badge.BackgroundTransparency = 1
+				badge.Text = "✗ Rejected"
+				badge.TextColor3 = DEL_TEXT
+				badge.TextSize = 10
+				badge.Font = Enum.Font.GothamBold
+				badge.Parent = hunkSep
+			end
+
+			pixelOffset += LINE_HEIGHT
+
+		elseif entry.isCollapsed then
+			lineOrder += 1
+			local collapseBar = Instance.new("TextButton")
+			collapseBar.Name = "Collapse_" .. lineOrder
+			collapseBar.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
+			collapseBar.BackgroundColor3 = DIFF_HEADER_BG
+			collapseBar.BorderSizePixel = 0
+			collapseBar.LayoutOrder = lineOrder
+			collapseBar.Text = string.format("  ⋯ %d lines hidden ⋯", entry.hiddenCount)
+			collapseBar.TextColor3 = GUTTER_TEXT
+			collapseBar.TextSize = 11
+			collapseBar.Font = Enum.Font.Code
+			collapseBar.TextXAlignment = Enum.TextXAlignment.Center
+			collapseBar.Parent = hunkScroll
+
+			local capturedKey = entry.regionKey
+			local capturedDiffId = diffId
+			collapseBar.Activated:Connect(function()
+				expandedRegions[capturedKey] = true
+				rerenderPanel(capturedDiffId)
+			end)
+
+			pixelOffset += LINE_HEIGHT
+
+		else
+			lineOrder += 1
+			if not firstChangePixelOffset and (entry.type == "add" or entry.type == "del") then
+				firstChangePixelOffset = pixelOffset
+			end
+			local lineRow = createDiffLineRow(entry, lineOrder, entry.hunkIdx ~= nil)
+			lineRow.Parent = hunkScroll
+			pixelOffset += LINE_HEIGHT
+		end
+	end
+
+	-- Auto-scroll only on initial build. Per-hunk re-renders preserve the
+	-- user's scroll position so they don't get yanked back to the top after
+	-- every accept/reject click.
+	if shouldScroll and firstChangePixelOffset then
+		task.defer(function()
+			local scrollY = math.max(0, firstChangePixelOffset - hunkScroll.AbsoluteSize.Y / 3)
+			hunkScroll.CanvasPosition = Vector2.new(0, scrollY)
+		end)
+	end
+
+	return pixelOffset
+end
+
+local function buildScriptPanel(diffId, diffData, sectionOrder)
+	-- Stats
+	local addCount, delCount = 0, 0
+	for _, hunk in diffData.hunks do
+		for _, line in hunk.lines do
+			if line.type == "add" then addCount += 1 end
+			if line.type == "del" then delCount += 1 end
+		end
+	end
+
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel_" .. diffId
+	panel.Size = UDim2.new(1, 0, 0, PANEL_HEADER_HEIGHT)
+	panel.AutomaticSize = Enum.AutomaticSize.Y
+	panel.BackgroundColor3 = DIFF_BG
+	panel.BorderSizePixel = 0
+	panel.LayoutOrder = sectionOrder
+	panel.Parent = diffScroll
+	-- No UISizeConstraint here: the cap lives on hunkScroll so a small diff
+	-- doesn't reserve the full 480px of vertical space in the outer list.
+
+	local panelLayout = Instance.new("UIListLayout")
+	panelLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	panelLayout.Padding = UDim.new(0, 0)
+	panelLayout.Parent = panel
+
+	-- Sticky action bar at the top
+	local header = Instance.new("Frame")
+	header.Name = "Header"
+	header.Size = UDim2.new(1, 0, 0, PANEL_HEADER_HEIGHT)
+	header.BackgroundColor3 = DIFF_HEADER_BG
+	header.BorderSizePixel = 0
+	header.LayoutOrder = 0
+	header.Parent = panel
+
+	-- Collapse chevron (left)
+	local chevron = Instance.new("TextButton")
+	chevron.Name = "Chevron"
+	chevron.Size = UDim2.new(0, 22, 0, 22)
+	chevron.Position = UDim2.new(0, 6, 0.5, -11)
+	chevron.BackgroundTransparency = 1
+	chevron.Text = if panelCollapsed[diffId] then "▸" else "▾"
+	chevron.TextColor3 = Color3.fromRGB(139, 148, 158)
+	chevron.TextSize = 14
+	chevron.Font = Enum.Font.GothamBold
+	chevron.Parent = header
+
+	local fileName = Instance.new("TextLabel")
+	fileName.Size = UDim2.new(1, -230, 1, 0)
+	fileName.Position = UDim2.new(0, 30, 0, 0)
+	fileName.BackgroundTransparency = 1
+	fileName.Text = diffData.scriptPath or diffData.scriptName or "Script"
+	fileName.TextColor3 = Color3.fromRGB(201, 209, 217)
+	fileName.TextSize = 13
+	fileName.Font = Enum.Font.Code
+	fileName.TextXAlignment = Enum.TextXAlignment.Left
+	fileName.TextTruncate = Enum.TextTruncate.AtEnd
+	fileName.Parent = header
+
+	local statsLabel = Instance.new("TextLabel")
+	statsLabel.Size = UDim2.new(0, 80, 0, 22)
+	statsLabel.Position = UDim2.new(1, -210, 0.5, -11)
+	statsLabel.BackgroundTransparency = 1
+	statsLabel.RichText = true
+	statsLabel.Text = '<font color="#3fb950">+' .. addCount .. '</font>  <font color="#f85149">-' .. delCount .. '</font>'
+	statsLabel.TextSize = 12
+	statsLabel.Font = Enum.Font.Code
+	statsLabel.Parent = header
+
+	local acceptBtn = Instance.new("TextButton")
+	acceptBtn.Size = UDim2.new(0, 64, 0, 24)
+	acceptBtn.Position = UDim2.new(1, -128, 0.5, -12)
+	acceptBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
+	acceptBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	acceptBtn.Text = "Accept All"
+	acceptBtn.TextSize = 11
+	acceptBtn.Font = Enum.Font.GothamBold
+	acceptBtn.BorderSizePixel = 0
+	acceptBtn.Parent = header
+	Instance.new("UICorner", acceptBtn).CornerRadius = UDim.new(0, 6)
+
+	local rejectBtn = Instance.new("TextButton")
+	rejectBtn.Size = UDim2.new(0, 60, 0, 24)
+	rejectBtn.Position = UDim2.new(1, -62, 0.5, -12)
+	rejectBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
+	rejectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	rejectBtn.Text = "Reject All"
+	rejectBtn.TextSize = 11
+	rejectBtn.Font = Enum.Font.GothamBold
+	rejectBtn.BorderSizePixel = 0
+	rejectBtn.Parent = header
+	Instance.new("UICorner", rejectBtn).CornerRadius = UDim.new(0, 6)
+
+	-- Per-panel scrollable body. AutomaticSize.Y lets short diffs shrink to fit;
+	-- the UISizeConstraint caps tall ones so a 1000-hunk file doesn't blow out
+	-- the outer dock widget.
+	local hunkScroll = Instance.new("ScrollingFrame")
+	hunkScroll.Name = "HunkScroll"
+	hunkScroll.Size = UDim2.new(1, 0, 0, 0)
+	hunkScroll.AutomaticSize = Enum.AutomaticSize.Y
+	hunkScroll.BackgroundTransparency = 1
+	hunkScroll.BorderSizePixel = 0
+	hunkScroll.ScrollBarThickness = 6
+	hunkScroll.ScrollBarImageColor3 = Color3.fromRGB(72, 79, 88)
+	hunkScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	hunkScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	hunkScroll.Visible = not panelCollapsed[diffId]
+	hunkScroll.LayoutOrder = 1
+	hunkScroll.Parent = panel
+
+	local hunkCap = Instance.new("UISizeConstraint")
+	hunkCap.MaxSize = Vector2.new(math.huge, PANEL_MAX_HEIGHT - PANEL_HEADER_HEIGHT)
+	hunkCap.Parent = hunkScroll
+
+	local hunkLayout = Instance.new("UIListLayout")
+	hunkLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	hunkLayout.Padding = UDim.new(0, 0)
+	hunkLayout.Parent = hunkScroll
+
+	local bottomBorder = Instance.new("Frame")
+	bottomBorder.Size = UDim2.new(1, 0, 0, 1)
+	bottomBorder.BackgroundColor3 = DIFF_BORDER
+	bottomBorder.BorderSizePixel = 0
+	bottomBorder.LayoutOrder = 2
+	bottomBorder.Parent = panel
+
+	local spacer = Instance.new("Frame")
+	spacer.Size = UDim2.new(1, 0, 0, 12)
+	spacer.BackgroundTransparency = 1
+	spacer.LayoutOrder = 3
+	spacer.Parent = panel
+
+	-- Track panel for per-panel re-render
+	activePanels[diffId] = panel
+
+	local capturedDiffId = diffId
+	local capturedDiffData = diffData
+
+	local function onPerHunkChange()
+		local allResolved = true
+		for _, h in capturedDiffData.hunks do
+			if h.status == "pending" then allResolved = false; break end
+		end
+		if allResolved then
+			local hasAccepted = false
+			for _, h in capturedDiffData.hunks do
+				if h.status == "accepted" then hasAccepted = true; break end
+			end
+			if hasAccepted then
+				local finalSource = applyPartialDiff(capturedDiffData)
+				if finalSource then
+					local inst = resolveInstance(capturedDiffData.scriptPath)
+					if inst and inst:IsA("LuaSourceContainer") then
+						ChangeHistoryService:SetWaypoint("LS:apply diff")
+						ScriptEditorService:UpdateSourceAsync(inst, function() return finalSource end)
+						ChangeHistoryService:SetWaypoint("LS:applied diff")
+					end
+				end
+			end
+			-- Guard against restage races: if stage_diff overwrote the slot
+			-- with a NEW diff sharing this id, don't archive/delete the new one.
+			if diffQueue[capturedDiffId] == capturedDiffData then
+				archiveDiff(capturedDiffId, capturedDiffData)
+				diffQueue[capturedDiffId] = nil
+				activePanels[capturedDiffId] = nil
+				panelCollapsed[capturedDiffId] = nil
+			end
+			task.defer(renderDiffUI)
+		else
+			rerenderPanel(capturedDiffId)
+		end
+	end
+
+	chevron.Activated:Connect(function()
+		panelCollapsed[capturedDiffId] = not panelCollapsed[capturedDiffId]
+		chevron.Text = if panelCollapsed[capturedDiffId] then "▸" else "▾"
+		hunkScroll.Visible = not panelCollapsed[capturedDiffId]
+	end)
+
+	acceptBtn.Activated:Connect(function()
+		httpPost("/diff/resolve", { diffId = capturedDiffId, action = "accept_all" })
+		for _, h in capturedDiffData.hunks do h.status = "accepted" end
+		local inst = resolveInstance(capturedDiffData.scriptPath)
+		if inst and inst:IsA("LuaSourceContainer") then
+			local newSource = reconstructNewSource(capturedDiffData)
+			if newSource then
+				ChangeHistoryService:SetWaypoint("LS:accept all")
+				ScriptEditorService:UpdateSourceAsync(inst, function() return newSource end)
+				ChangeHistoryService:SetWaypoint("LS:accepted all")
+			end
+		end
+		if diffQueue[capturedDiffId] == capturedDiffData then
+			archiveDiff(capturedDiffId, capturedDiffData)
+			diffQueue[capturedDiffId] = nil
+			activePanels[capturedDiffId] = nil
+			panelCollapsed[capturedDiffId] = nil
+		end
+		showToast("Diff accepted: " .. (capturedDiffData.scriptName or capturedDiffData.scriptPath or "Script"), "success")
+		task.defer(renderDiffUI)
+	end)
+
+	rejectBtn.Activated:Connect(function()
+		httpPost("/diff/resolve", { diffId = capturedDiffId, action = "reject_all" })
+		for _, h in capturedDiffData.hunks do h.status = "rejected" end
+		if diffQueue[capturedDiffId] == capturedDiffData then
+			archiveDiff(capturedDiffId, capturedDiffData)
+			diffQueue[capturedDiffId] = nil
+			activePanels[capturedDiffId] = nil
+			panelCollapsed[capturedDiffId] = nil
+		end
+		showToast("Diff rejected: " .. (capturedDiffData.scriptName or capturedDiffData.scriptPath or "Script"), "error")
+		task.defer(renderDiffUI)
+	end)
+
+	renderPanelBody(panel, hunkScroll, diffId, diffData, onPerHunkChange, true)
+	return panel
+end
+
+rerenderPanel = function(diffId)
+	local panel = activePanels[diffId]
+	local diffData = diffQueue[diffId]
+	if not panel or not diffData then
+		renderDiffUI()
+		return
+	end
+	local hunkScroll = panel:FindFirstChild("HunkScroll")
+	if not hunkScroll then return end
+
+	-- Refresh just the stats and body — keep buttons/connections in place
+	local header = panel:FindFirstChild("Header")
+	if header then
 		local addCount, delCount = 0, 0
 		for _, hunk in diffData.hunks do
 			for _, line in hunk.lines do
@@ -3563,303 +4124,62 @@ renderDiffUI = function()
 				if line.type == "del" then delCount += 1 end
 			end
 		end
-
-		-- ═══ File header bar (like GitHub's file bar) ═══
-		local fileHeader = Instance.new("Frame")
-		fileHeader.Name = "FileHeader_" .. diffId
-		fileHeader.Size = UDim2.new(1, 0, 0, 36)
-		fileHeader.BackgroundColor3 = DIFF_HEADER_BG
-		fileHeader.BorderSizePixel = 0
-		fileHeader.LayoutOrder = sectionOrder * 1000
-		fileHeader.Parent = diffScroll
-
-		-- File name
-		local fileName = Instance.new("TextLabel")
-		fileName.Size = UDim2.new(1, -220, 1, 0)
-		fileName.Position = UDim2.new(0, 12, 0, 0)
-		fileName.BackgroundTransparency = 1
-		fileName.Text = diffData.scriptPath or diffData.scriptName or "Script"
-		fileName.TextColor3 = Color3.fromRGB(201, 209, 217)
-		fileName.TextSize = 13
-		fileName.Font = Enum.Font.Code
-		fileName.TextXAlignment = Enum.TextXAlignment.Left
-		fileName.TextTruncate = Enum.TextTruncate.AtEnd
-		fileName.Parent = fileHeader
-
-		-- Stats badge
-		local statsLabel = Instance.new("TextLabel")
-		statsLabel.Size = UDim2.new(0, 80, 0, 22)
-		statsLabel.Position = UDim2.new(1, -210, 0.5, -11)
-		statsLabel.BackgroundTransparency = 1
-		statsLabel.RichText = true
-		statsLabel.Text = '<font color="#3fb950">+' .. addCount .. '</font>  <font color="#f85149">-' .. delCount .. '</font>'
-		statsLabel.TextSize = 12
-		statsLabel.Font = Enum.Font.Code
-		statsLabel.Parent = fileHeader
-
-		-- Accept All button (compact)
-		local acceptBtn = Instance.new("TextButton")
-		acceptBtn.Size = UDim2.new(0, 56, 0, 24)
-		acceptBtn.Position = UDim2.new(1, -120, 0.5, -12)
-		acceptBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
-		acceptBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-		acceptBtn.Text = "Accept"
-		acceptBtn.TextSize = 11
-		acceptBtn.Font = Enum.Font.GothamBold
-		acceptBtn.BorderSizePixel = 0
-		acceptBtn.Parent = fileHeader
-		Instance.new("UICorner", acceptBtn).CornerRadius = UDim.new(0, 6)
-
-		-- Reject All button (compact)
-		local rejectBtn = Instance.new("TextButton")
-		rejectBtn.Size = UDim2.new(0, 52, 0, 24)
-		rejectBtn.Position = UDim2.new(1, -58, 0.5, -12)
-		rejectBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
-		rejectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-		rejectBtn.Text = "Reject"
-		rejectBtn.TextSize = 11
-		rejectBtn.Font = Enum.Font.GothamBold
-		rejectBtn.BorderSizePixel = 0
-		rejectBtn.Parent = fileHeader
-		Instance.new("UICorner", rejectBtn).CornerRadius = UDim.new(0, 6)
-
-		-- ═══ Render full script with hunks ═══
-		local lineOrder = sectionOrder * 1000
-		local firstChangePixelOffset = nil
-		local pixelOffset = 36 -- file header height
-
-		-- Build display lines: full script if oldSource available, else hunks only
-		local displayLines
-		if diffData.oldSource then
-			local fullLines = buildFullScriptLines(diffData.oldSource, diffData.hunks)
-			displayLines = collapseFullScriptLines(fullLines, expandedRegions)
-		else
-			displayLines = {}
-			for hunkIdx, hunk in diffData.hunks do
-				table.insert(displayLines, { isHunkBoundary = true, hunkIdx = hunkIdx })
-				for _, line in hunk.lines do
-					table.insert(displayLines, {
-						type = line.type,
-						lineOld = line.lineOld,
-						lineNew = line.lineNew,
-						content = line.content,
-						hunkIdx = hunkIdx,
-					})
-				end
+		for _, c in header:GetChildren() do
+			if c:IsA("TextLabel") and c.RichText then
+				c.Text = '<font color="#3fb950">+' .. addCount .. '</font>  <font color="#f85149">-' .. delCount .. '</font>'
 			end
 		end
+	end
 
-		for _, entry in displayLines do
-			if entry.isHunkBoundary then
-				local hunkIdx = entry.hunkIdx
-				local hunk = diffData.hunks[hunkIdx]
-				lineOrder += 1
-
-				-- Hunk separator bar (@@-style)
-				local hunkSep = Instance.new("Frame")
-				hunkSep.Name = "HunkSep_" .. hunkIdx
-				hunkSep.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
-				hunkSep.BackgroundColor3 = HUNK_SEPARATOR_BG
-				hunkSep.BorderSizePixel = 0
-				hunkSep.LayoutOrder = lineOrder
-				hunkSep.Parent = diffScroll
-
-				local hunkLabel = Instance.new("TextLabel")
-				hunkLabel.Size = UDim2.new(1, -12, 1, 0)
-				hunkLabel.Position = UDim2.new(0, GUTTER_WIDTH * 2 + 8, 0, 0)
-				hunkLabel.BackgroundTransparency = 1
-				hunkLabel.Text = string.format("@@ Hunk %d — lines %d-%d @@", hunkIdx, hunk.startOld, hunk.startOld + #hunk.lines)
-				hunkLabel.TextColor3 = HUNK_SEPARATOR_TEXT
-				hunkLabel.TextSize = 12
-				hunkLabel.Font = Enum.Font.Code
-				hunkLabel.TextXAlignment = Enum.TextXAlignment.Left
-				hunkLabel.Parent = hunkSep
-
-				-- Per-hunk accept/reject (small, right-aligned in separator)
-				if hunk.status == "pending" then
-					local hAccBtn = Instance.new("TextButton")
-					hAccBtn.Size = UDim2.new(0, 20, 0, 18)
-					hAccBtn.Position = UDim2.new(1, -48, 0.5, -9)
-					hAccBtn.BackgroundColor3 = Color3.fromRGB(35, 134, 54)
-					hAccBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-					hAccBtn.Text = "✓"
-					hAccBtn.TextSize = 11
-					hAccBtn.Font = Enum.Font.GothamBold
-					hAccBtn.BorderSizePixel = 0
-					hAccBtn.Parent = hunkSep
-					Instance.new("UICorner", hAccBtn).CornerRadius = UDim.new(0, 4)
-
-					local hRejBtn = Instance.new("TextButton")
-					hRejBtn.Size = UDim2.new(0, 20, 0, 18)
-					hRejBtn.Position = UDim2.new(1, -24, 0.5, -9)
-					hRejBtn.BackgroundColor3 = Color3.fromRGB(140, 25, 30)
-					hRejBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-					hRejBtn.Text = "✗"
-					hRejBtn.TextSize = 11
-					hRejBtn.Font = Enum.Font.GothamBold
-					hRejBtn.BorderSizePixel = 0
-					hRejBtn.Parent = hunkSep
-					Instance.new("UICorner", hRejBtn).CornerRadius = UDim.new(0, 4)
-
-					local capturedDiffId = diffId
-					local capturedHunkId = hunk.id
-
-					local function checkAllResolved()
-						local allResolved = true
-						for _, h in diffData.hunks do
-							if h.status == "pending" then allResolved = false; break end
-						end
-						if allResolved then
-							local hasAccepted = false
-							for _, h in diffData.hunks do
-								if h.status == "accepted" then hasAccepted = true; break end
-							end
-							if hasAccepted then
-								local finalSource = applyPartialDiff(diffData)
-								if finalSource then
-									local inst = resolveInstance(diffData.scriptPath)
-									if inst and inst:IsA("LuaSourceContainer") then
-										ChangeHistoryService:SetWaypoint("LS:apply diff")
-										ScriptEditorService:UpdateSourceAsync(inst, function() return finalSource end)
-										ChangeHistoryService:SetWaypoint("LS:applied diff")
-									end
-								end
-							end
-							archiveDiff(capturedDiffId, diffData)
-							diffQueue[capturedDiffId] = nil
-						end
-						task.defer(renderDiffUI)
+	local onPerHunkChange
+	onPerHunkChange = function()
+		local allResolved = true
+		for _, h in diffData.hunks do
+			if h.status == "pending" then allResolved = false; break end
+		end
+		if allResolved then
+			local hasAccepted = false
+			for _, h in diffData.hunks do
+				if h.status == "accepted" then hasAccepted = true; break end
+			end
+			if hasAccepted then
+				local finalSource = applyPartialDiff(diffData)
+				if finalSource then
+					local inst = resolveInstance(diffData.scriptPath)
+					if inst and inst:IsA("LuaSourceContainer") then
+						ChangeHistoryService:SetWaypoint("LS:apply diff")
+						ScriptEditorService:UpdateSourceAsync(inst, function() return finalSource end)
+						ChangeHistoryService:SetWaypoint("LS:applied diff")
 					end
-
-					hAccBtn.Activated:Connect(function()
-						httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "accept" })
-						hunk.status = "accepted"
-						checkAllResolved()
-					end)
-					hRejBtn.Activated:Connect(function()
-						httpPost("/diff/resolve", { diffId = capturedDiffId, hunkId = capturedHunkId, action = "reject" })
-						hunk.status = "rejected"
-						checkAllResolved()
-					end)
-				elseif hunk.status == "accepted" then
-					local badge = Instance.new("TextLabel")
-					badge.Size = UDim2.new(0, 60, 0, 18)
-					badge.Position = UDim2.new(1, -66, 0.5, -9)
-					badge.BackgroundTransparency = 1
-					badge.Text = "✓ Accepted"
-					badge.TextColor3 = ADD_TEXT
-					badge.TextSize = 10
-					badge.Font = Enum.Font.GothamBold
-					badge.Parent = hunkSep
-				elseif hunk.status == "rejected" then
-					local badge = Instance.new("TextLabel")
-					badge.Size = UDim2.new(0, 60, 0, 18)
-					badge.Position = UDim2.new(1, -66, 0.5, -9)
-					badge.BackgroundTransparency = 1
-					badge.Text = "✗ Rejected"
-					badge.TextColor3 = DEL_TEXT
-					badge.TextSize = 10
-					badge.Font = Enum.Font.GothamBold
-					badge.Parent = hunkSep
-				end
-
-				pixelOffset += LINE_HEIGHT
-
-			elseif entry.isCollapsed then
-				lineOrder += 1
-				local collapseBar = Instance.new("TextButton")
-				collapseBar.Name = "Collapse_" .. lineOrder
-				collapseBar.Size = UDim2.new(1, 0, 0, LINE_HEIGHT)
-				collapseBar.BackgroundColor3 = DIFF_HEADER_BG
-				collapseBar.BorderSizePixel = 0
-				collapseBar.LayoutOrder = lineOrder
-				collapseBar.Text = string.format("  ⋯ %d lines hidden ⋯", entry.hiddenCount)
-				collapseBar.TextColor3 = GUTTER_TEXT
-				collapseBar.TextSize = 11
-				collapseBar.Font = Enum.Font.Code
-				collapseBar.TextXAlignment = Enum.TextXAlignment.Center
-				collapseBar.Parent = diffScroll
-
-				local capturedKey = entry.regionKey
-				collapseBar.Activated:Connect(function()
-					expandedRegions[capturedKey] = true
-					task.defer(renderDiffUI)
-				end)
-
-				pixelOffset += LINE_HEIGHT
-
-			else
-				lineOrder += 1
-				if not firstChangePixelOffset and (entry.type == "add" or entry.type == "del") then
-					firstChangePixelOffset = pixelOffset
-				end
-				local lineRow = createDiffLineRow(entry, lineOrder, entry.hunkIdx ~= nil)
-				lineRow.Parent = diffScroll
-				pixelOffset += LINE_HEIGHT
-			end
-		end
-
-		if not globalFirstChangeOffset and firstChangePixelOffset then
-			globalFirstChangeOffset = globalPixelOffset + firstChangePixelOffset
-		end
-		globalPixelOffset += pixelOffset
-
-		-- ═══ Bottom border ═══
-		lineOrder += 1
-		local bottomBorder = Instance.new("Frame")
-		bottomBorder.Size = UDim2.new(1, 0, 0, 1)
-		bottomBorder.BackgroundColor3 = DIFF_BORDER
-		bottomBorder.BorderSizePixel = 0
-		bottomBorder.LayoutOrder = lineOrder
-		bottomBorder.Parent = diffScroll
-
-		-- Spacer between files
-		lineOrder += 1
-		local spacer = Instance.new("Frame")
-		spacer.Size = UDim2.new(1, 0, 0, 16)
-		spacer.BackgroundTransparency = 1
-		spacer.LayoutOrder = lineOrder
-		spacer.Parent = diffScroll
-
-		-- ═══ Wire up file-level accept/reject ═══
-		local capturedDiffId = diffId
-		acceptBtn.Activated:Connect(function()
-			httpPost("/diff/resolve", { diffId = capturedDiffId, action = "accept_all" })
-			for _, h in diffData.hunks do h.status = "accepted" end
-			local inst = resolveInstance(diffData.scriptPath)
-			if inst and inst:IsA("LuaSourceContainer") then
-				local newSource = reconstructNewSource(diffData)
-				if newSource then
-					ChangeHistoryService:SetWaypoint("LS:accept all")
-					ScriptEditorService:UpdateSourceAsync(inst, function() return newSource end)
-					ChangeHistoryService:SetWaypoint("LS:accepted all")
 				end
 			end
-			archiveDiff(capturedDiffId, diffData)
-			diffQueue[capturedDiffId] = nil
-			showToast("Diff accepted: " .. (diffData.scriptName or diffData.scriptPath or "Script"), "success")
+			if diffQueue[diffId] == diffData then
+				archiveDiff(diffId, diffData)
+				diffQueue[diffId] = nil
+				activePanels[diffId] = nil
+				panelCollapsed[diffId] = nil
+			end
 			task.defer(renderDiffUI)
-		end)
+		else
+			rerenderPanel(diffId)
+		end
+	end
+	renderPanelBody(panel, hunkScroll, diffId, diffData, onPerHunkChange, false)
+end
 
-		rejectBtn.Activated:Connect(function()
-			httpPost("/diff/resolve", { diffId = capturedDiffId, action = "reject_all" })
-			for _, h in diffData.hunks do h.status = "rejected" end
-			archiveDiff(capturedDiffId, diffData)
-			diffQueue[capturedDiffId] = nil
-			showToast("Diff rejected: " .. (diffData.scriptName or diffData.scriptPath or "Script"), "error")
-			task.defer(renderDiffUI)
-		end)
+renderDiffUI = function()
+	if diffViewMode ~= "pending" then return end
+
+	clearDiffScroll()
+	activePanels = {}
+
+	local sectionOrder = 0
+	for diffId, diffData in diffQueue do
+		sectionOrder += 1
+		buildScriptPanel(diffId, diffData, sectionOrder)
 	end
 
 	updateDiffBadge()
-
-	-- Auto-scroll to first change
-	if globalFirstChangeOffset then
-		task.defer(function()
-			local scrollY = math.max(0, globalFirstChangeOffset - diffScroll.AbsoluteSize.Y / 3)
-			diffScroll.CanvasPosition = Vector2.new(0, scrollY)
-		end)
-	end
 end
 
 -- ============================================================================
@@ -5404,6 +5724,11 @@ end)
 -- Main Communication Loop
 -- ============================================================================
 
+local function refreshAutoAcceptIndicator()
+	local ok, budget = httpGet("/config/auto-accept")
+	if ok then updateAutoAcceptIndicator(budget) end
+end
+
 local function heartbeat()
 	local t0 = os.clock()
 	local ok, result = httpPost("/heartbeat", {
@@ -5418,6 +5743,9 @@ local function heartbeat()
 			connected = true
 			updateStatus("idle", "Connected — idle")
 			showToast("Connected to server", "success")
+			-- Re-fetch budget on every reconnect so the indicator is correct
+			-- even if state changed while we were offline.
+			task.spawn(refreshAutoAcceptIndicator)
 		end
 		if result.mode then currentMode = result.mode end
 		return true
@@ -5500,12 +5828,28 @@ startMascotAnimations()
 -- Toggle Button
 -- ============================================================================
 
+-- Dedicated 5s loop so the auto-accept indicator reflects external
+-- set_auto_accept tool calls and budget decrements without depending on
+-- heartbeat cadence (heartbeats can take ~25s when poll long-polls block).
+local function autoAcceptPollLoop()
+	while running do
+		if connected then
+			pcall(refreshAutoAcceptIndicator)
+		end
+		for _ = 1, 50 do
+			if not running then break end
+			task.wait(0.1)
+		end
+	end
+end
+
 local function startConnection()
 	if running then return end
 	running = true
 	widget.Enabled = true
 	updateConnectButton()
 	task.spawn(mainLoop)
+	task.spawn(autoAcceptPollLoop)
 end
 
 local function stopConnection()

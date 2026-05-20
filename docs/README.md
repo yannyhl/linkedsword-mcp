@@ -76,7 +76,7 @@ Three modes managed by `bridge.shouldAutoAccept()`:
 - `next_n`: the next N diffs auto-apply; each accept consumes one budget unit. When it hits zero, the bridge flips back to `off`.
 - `session`: every diff auto-applies until the budget is explicitly turned off or the plugin reconnects.
 
-Set via the `set_auto_accept` tool; inspect via `get_auto_accept_status`.
+Set via the `set_auto_accept` tool; inspect via `get_auto_accept_status`. The plugin UI's segmented Off/Session/Next-N control writes the same state over the bridge's `POST /config/auto-accept` (mirrors the tool's zod constraints), and a dedicated plugin-side loop polls `GET /config/auto-accept` so the header indicator reflects external changes.
 
 ## Planning Mode
 
