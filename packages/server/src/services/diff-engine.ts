@@ -143,16 +143,28 @@ function buildHunks(changes: Change[]): DiffHunk[] {
   let hunkStartNew = 1;
   let inChange = false;
   let contextBefore: DiffLine[] = [];
+  // Highest lineOld already emitted into a flushed hunk. Used to prevent the
+  // next hunk's leading context from duplicating lines that the previous hunk
+  // already carried as trailing context — otherwise applyDiff / reconstruct
+  // double-emits those shared lines and the result has duplicated source.
+  let lastEmittedOld = 0;
 
   for (const change of changes) {
     const lines = change.value.replace(/\n$/, "").split("\n");
 
     if (change.added || change.removed) {
       if (!inChange) {
-        // Start of a new hunk — include up to 3 lines of context before
-        hunkStartOld = Math.max(1, oldLine - contextBefore.length);
-        hunkStartNew = Math.max(1, newLine - contextBefore.length);
-        currentLines = [...contextBefore];
+        const dedupedCtx = contextBefore.filter(
+          (c) => (c.lineOld ?? 0) > lastEmittedOld,
+        );
+        if (dedupedCtx.length > 0) {
+          hunkStartOld = dedupedCtx[0].lineOld!;
+          hunkStartNew = dedupedCtx[0].lineNew!;
+        } else {
+          hunkStartOld = oldLine;
+          hunkStartNew = newLine;
+        }
+        currentLines = [...dedupedCtx];
         inChange = true;
       }
 
@@ -184,6 +196,7 @@ function buildHunks(changes: Change[]): DiffHunk[] {
           lines: currentLines,
           status: "pending",
         });
+        lastEmittedOld = oldLine - 1;
         currentLines = [];
         inChange = false;
 
@@ -198,10 +211,10 @@ function buildHunks(changes: Change[]): DiffHunk[] {
       }
 
       // Track trailing context for the next hunk
-      contextBefore = lines.slice(-3).map((content, i) => ({
+      contextBefore = lines.slice(-3).map((content, i, arr) => ({
         type: "ctx" as const,
-        lineOld: oldLine - (3 - i),
-        lineNew: newLine - (3 - i),
+        lineOld: oldLine - arr.length + i,
+        lineNew: newLine - arr.length + i,
         content,
       }));
     }
